@@ -1,0 +1,5 @@
+{
+  "enable": true,
+  "unstable": false,
+  "importMap": "./supabase/functions/import_map.json"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "company-membership",
+  "version": "1.0.0",
+  "exports": "./index.ts",
+  "tasks": {},
+  "imports": {}
+}

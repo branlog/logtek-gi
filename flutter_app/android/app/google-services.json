@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "973578391431",
+    "project_id": "logtek-gi",
+    "storage_bucket": "logtek-gi.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:973578391431:android:8d79919682349992f9cd22",
+        "android_client_info": {
+          "package_name": "com.example.logtek_gi"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAHuAlkjlbxM9mehSAR4catB72XUhd_wh0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

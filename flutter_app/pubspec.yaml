@@ -1,0 +1,37 @@
+name: logtek_gi
+description: Logtek G&I (Gestion & Inventaire) — Flutter starter
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  crypto: ^3.0.3
+
+  # Réseau / utilitaires
+  http: ^1.2.2
+  intl: ^0.20.2
+  uuid: ^4.5.1
+  url_launcher: ^6.3.0
+  # Auth + DB
+  supabase_flutter: ^2.5.6
+  connectivity_plus: ^6.0.5
+  path_provider: ^2.1.4
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/logtek_logo.png
+    - assets/images/logtek_logo_flat.png

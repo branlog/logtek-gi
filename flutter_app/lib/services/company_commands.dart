@@ -1,0 +1,723 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../models/company_role.dart';
+
+class CommandResult<T> {
+  const CommandResult({this.data, this.error});
+
+  final T? data;
+  final Object? error;
+
+  bool get ok => error == null;
+}
+
+class CompanyCommands {
+  CompanyCommands(this._client);
+
+  final SupabaseClient _client;
+
+  SupabaseClient get client => _client;
+
+  Future<CommandResult<Map<String, dynamic>>> createCompany({
+    required String name,
+    String? shopDomain,
+    String? shopId,
+  }) async {
+    final currentUser = _client.auth.currentUser;
+    if (currentUser == null) {
+      return const CommandResult(error: 'Utilisateur non authentifié');
+    }
+
+    final payload = <String, dynamic>{
+      'name': name.trim(),
+      'owner_uid': currentUser.id,
+      if (shopDomain != null && shopDomain.trim().isNotEmpty)
+        'shop_domain': shopDomain.trim(),
+      if (shopId != null && shopId.trim().isNotEmpty) 'shop_id': shopId.trim(),
+    };
+
+    try {
+      final response =
+          await _client.from('companies').insert(payload).select().single();
+      final company = Map<String, dynamic>.from(response as Map);
+
+      try {
+        await _client.from('memberships').insert({
+          'company_id': company['id'],
+          'user_uid': currentUser.id,
+          'role': 'owner',
+        });
+      } on PostgrestException catch (error) {
+        return CommandResult(
+          data: company,
+          error:
+              'Entreprise créée mais impossible d’ajouter le membership owner : ${error.message}',
+        );
+      }
+
+      return CommandResult<Map<String, dynamic>>(data: company);
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createWarehouse({
+    required String companyId,
+    required String name,
+    String? code,
+  }) async {
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'name': name.trim(),
+      if (code != null && code.trim().isNotEmpty) 'code': code.trim(),
+    };
+
+    try {
+      final response =
+          await _client.from('warehouses').insert(payload).select().single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createItem({
+    required String companyId,
+    required String name,
+    String? sku,
+    String? unit,
+    String? category,
+  }) async {
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'name': name.trim(),
+      if (sku != null && sku.trim().isNotEmpty) 'sku': sku.trim(),
+      if (unit != null && unit.trim().isNotEmpty) 'unit': unit.trim(),
+      if (category != null && category.trim().isNotEmpty)
+        'category': category.trim(),
+    };
+
+    try {
+      final response =
+          await _client.from('items').insert(payload).select().single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteItem({
+    required String companyId,
+    required String itemId,
+  }) async {
+    try {
+      await _client
+          .from('stock')
+          .delete()
+          .eq('company_id', companyId)
+          .eq('item_id', itemId);
+      await _client
+          .from('items')
+          .delete()
+          .eq('company_id', companyId)
+          .eq('id', itemId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<int>> applyStockDelta({
+    required String companyId,
+    required String itemId,
+    required String warehouseId,
+    required int delta,
+  }) async {
+    if (delta == 0) {
+      try {
+        final existing = await _client
+            .from('stock')
+            .select('qty')
+            .eq('company_id', companyId)
+            .eq('item_id', itemId)
+            .eq('warehouse_id', warehouseId)
+            .maybeSingle();
+        final currentQty =
+            existing == null ? 0 : ((existing['qty'] as num?)?.round() ?? 0);
+        return CommandResult<int>(data: currentQty);
+      } on PostgrestException catch (error) {
+        return CommandResult<int>(error: error.message);
+      } catch (error) {
+        return CommandResult<int>(error: error);
+      }
+    }
+
+    try {
+      final existing = await _client
+          .from('stock')
+          .select('id, qty')
+          .eq('company_id', companyId)
+          .eq('item_id', itemId)
+          .eq('warehouse_id', warehouseId)
+          .maybeSingle();
+
+      final currentQty =
+          existing == null ? 0 : ((existing['qty'] as num?)?.round() ?? 0);
+      final newQty = currentQty + delta;
+
+      if (existing == null && delta < 0) {
+        return const CommandResult<int>(
+          error: 'Impossible de retirer du stock inexistant pour cet entrepôt.',
+        );
+      }
+
+      if (newQty < 0) {
+        return const CommandResult<int>(
+          error: 'Stock insuffisant pour cet entrepôt.',
+        );
+      }
+
+      if (existing == null) {
+        await _client.from('stock').insert({
+          'company_id': companyId,
+          'item_id': itemId,
+          'warehouse_id': warehouseId,
+          'qty': newQty,
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        });
+      } else {
+        await _client
+            .from('stock')
+            .update({
+              'qty': newQty,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            })
+            .eq('company_id', companyId)
+            .eq('item_id', itemId)
+            .eq('warehouse_id', warehouseId);
+      }
+
+      return CommandResult<int>(data: newQty);
+    } on PostgrestException catch (error) {
+      return CommandResult<int>(error: error.message);
+    } catch (error) {
+      return CommandResult<int>(error: error);
+    }
+  }
+
+  Future<CommandResult<int>> incrementStock({
+    required String companyId,
+    required String itemId,
+    required String warehouseId,
+    required int qty,
+  }) async {
+    return applyStockDelta(
+      companyId: companyId,
+      itemId: itemId,
+      warehouseId: warehouseId,
+      delta: qty,
+    );
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createEquipment({
+    required String companyId,
+    required String name,
+    String? brand,
+    String? model,
+    String? serial,
+  }) async {
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'name': name.trim(),
+      if (brand != null && brand.trim().isNotEmpty) 'brand': brand.trim(),
+      if (model != null && model.trim().isNotEmpty) 'model': model.trim(),
+      if (serial != null && serial.trim().isNotEmpty) 'serial': serial.trim(),
+    };
+
+    try {
+      final response =
+          await _client.from('equipment').insert(payload).select().single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> updateEquipmentMeta({
+    required String equipmentId,
+    required Map<String, dynamic> meta,
+  }) async {
+    try {
+      final response = await _client
+          .from('equipment')
+          .update({'meta': meta})
+          .eq('id', equipmentId)
+          .select(
+            'id, name, brand, model, serial, active, meta, created_at',
+          )
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Équipement introuvable ou déjà supprimé.',
+        );
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createPurchaseRequest({
+    required String companyId,
+    required String name,
+    required int qty,
+    String? warehouseId,
+    String? note,
+  }) async {
+    final currentUser = _client.auth.currentUser;
+    if (currentUser == null) {
+      return const CommandResult(error: 'Utilisateur non authentifié');
+    }
+
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'created_by': currentUser.id,
+      'name': name.trim(),
+      'qty': qty,
+      if (warehouseId != null && warehouseId.isNotEmpty)
+        'warehouse_id': warehouseId,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    };
+
+    try {
+      final response = await _client
+          .from('purchase_requests')
+          .insert(payload)
+          .select(
+            'id, name, qty, note, status, item_id, warehouse_id, purchased_at, created_at, warehouse:warehouses(id, name)',
+          )
+          .single();
+
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> updatePurchaseRequest({
+    required String requestId,
+    required Map<String, dynamic> patch,
+  }) async {
+    try {
+      final response = await _client
+          .from('purchase_requests')
+          .update(patch)
+          .eq('id', requestId)
+          .select(
+            'id, name, qty, note, status, item_id, warehouse_id, purchased_at, created_at, warehouse:warehouses(id, name)',
+          )
+          .maybeSingle();
+
+      if (response == null) {
+        return const CommandResult(
+            error: 'Demande d’achat introuvable ou déjà supprimée.');
+      }
+
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deletePurchaseRequest({
+    required String requestId,
+  }) async {
+    try {
+      await _client.from('purchase_requests').delete().eq('id', requestId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createMove({
+    required String companyId,
+    required String type,
+    required String itemId,
+    required int qty,
+    String? warehouseFrom,
+    String? warehouseTo,
+    String? note,
+    String? ref,
+  }) async {
+    final params = <String, dynamic>{
+      'p_company_id': companyId,
+      'p_type': type,
+      'p_item_id': itemId,
+      'p_qty': qty,
+      if (warehouseFrom != null) 'p_warehouse_from': warehouseFrom,
+      if (warehouseTo != null) 'p_warehouse_to': warehouseTo,
+      if (note != null && note.trim().isNotEmpty) 'p_note': note.trim(),
+      if (ref != null && ref.trim().isNotEmpty) 'p_ref': ref.trim(),
+    };
+
+    try {
+      final response = await _client.rpc('create_move', params: params);
+      if (response is Map<String, dynamic>) {
+        return CommandResult<Map<String, dynamic>>(data: response);
+      }
+      if (response is Map) {
+        final normalized = <String, dynamic>{};
+        response.forEach((key, value) {
+          if (key == null) return;
+          final keyStr = key.toString();
+          if (keyStr.isEmpty) return;
+          normalized[keyStr] = value;
+        });
+        return CommandResult<Map<String, dynamic>>(data: normalized);
+      }
+      return const CommandResult<Map<String, dynamic>>(
+          data: <String, dynamic>{});
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> upsertUserProfile({
+    required String userUid,
+    String? firstName,
+    String? lastName,
+    String? role,
+    String? phone,
+    String? address,
+  }) async {
+    String? clean(String? value) {
+      final trimmed = value?.trim();
+      if (trimmed == null || trimmed.isEmpty) return null;
+      return trimmed;
+    }
+
+    final payload = <String, dynamic>{
+      'user_uid': userUid,
+      'first_name': clean(firstName),
+      'last_name': clean(lastName),
+      'role': clean(role),
+      'phone': clean(phone),
+      'address': clean(address),
+    };
+
+    try {
+      final response = await _client
+          .from('user_profiles')
+          .upsert(payload, onConflict: 'user_uid')
+          .select()
+          .single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error.message);
+    } catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> addMembership({
+    required String companyId,
+    required String userUid,
+    required String role,
+  }) async {
+    final trimmedUid = userUid.trim();
+    if (trimmedUid.isEmpty) {
+      return const CommandResult(error: 'UID utilisateur requis.');
+    }
+    final normalizedRole = role.trim().toLowerCase();
+    if (!CompanyRoles.isValid(normalizedRole)) {
+      return const CommandResult(error: 'Rôle invalide.');
+    }
+
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'user_uid': trimmedUid,
+      'role': normalizedRole,
+    };
+
+    try {
+      final response = await _client
+          .from('memberships')
+          .insert(payload)
+          .select('user_uid, role, created_at')
+          .single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error.message);
+    } catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> updateMembershipRole({
+    required String companyId,
+    required String userUid,
+    required String role,
+  }) async {
+    final trimmedUid = userUid.trim();
+    if (trimmedUid.isEmpty) {
+      return const CommandResult(error: 'UID utilisateur requis.');
+    }
+    final normalizedRole = role.trim().toLowerCase();
+    if (!CompanyRoles.isValid(normalizedRole)) {
+      return const CommandResult(error: 'Rôle invalide.');
+    }
+
+    final payload = <String, dynamic>{
+      'role': normalizedRole,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+
+    try {
+      final response = await _client
+          .from('memberships')
+          .update(payload)
+          .eq('company_id', companyId)
+          .eq('user_uid', trimmedUid)
+          .select('user_uid')
+          .maybeSingle();
+
+      if (response == null) {
+        return const CommandResult<void>(
+          error: 'Membre introuvable ou déjà retiré.',
+        );
+      }
+
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> removeMembership({
+    required String companyId,
+    required String userUid,
+  }) async {
+    final trimmedUid = userUid.trim();
+    if (trimmedUid.isEmpty) {
+      return const CommandResult(error: 'UID utilisateur requis.');
+    }
+
+    try {
+      final response = await _client
+          .from('memberships')
+          .delete()
+          .eq('company_id', companyId)
+          .eq('user_uid', trimmedUid)
+          .select('user_uid')
+          .maybeSingle();
+
+      if (response == null) {
+        return const CommandResult<void>(
+          error: 'Membre introuvable ou déjà retiré.',
+        );
+      }
+
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> inviteMemberByEmail({
+    required String companyId,
+    required String email,
+    required String role,
+    String? notes,
+  }) async {
+    final normalizedRole = role.trim().toLowerCase();
+    if (!CompanyRoles.isValid(normalizedRole)) {
+      return const CommandResult(error: 'Rôle invalide.');
+    }
+    final trimmedEmail = email.trim();
+    if (trimmedEmail.isEmpty) {
+      return const CommandResult(error: 'L’adresse e-mail est requise.');
+    }
+
+    try {
+      final response = await _client.functions.invoke(
+        'company-membership/invite',
+        body: {
+          'companyId': companyId,
+          'email': trimmedEmail,
+          'role': normalizedRole,
+          if (notes != null && notes.trim().isNotEmpty) 'notes': notes.trim(),
+        },
+      );
+      final data = response.data;
+      return CommandResult<Map<String, dynamic>>(
+        data: data is Map<String, dynamic> ? data : <String, dynamic>{},
+      );
+    } on FunctionException catch (error) {
+      final detail = error.details?.toString();
+      return CommandResult<Map<String, dynamic>>(
+        error: detail?.isNotEmpty == true
+            ? detail
+            : error.reasonPhrase ?? 'Erreur lors de l’envoi de l’invitation.',
+      );
+    } catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> cancelMembershipInvite({
+    required String inviteId,
+  }) async {
+    try {
+      await _client.from('membership_invites').update({
+        'status': 'cancelled',
+        'responded_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', inviteId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createJoinCode({
+    required String companyId,
+    required String role,
+    required String codeHash,
+    required String codeHint,
+    String? label,
+    int? maxUses,
+    DateTime? expiresAt,
+  }) async {
+    final normalizedRole = role.trim().toLowerCase();
+    if (!CompanyRoles.isValid(normalizedRole)) {
+      return const CommandResult(error: 'Rôle invalide.');
+    }
+    if (codeHash.trim().isEmpty) {
+      return const CommandResult(error: 'Code invalide.');
+    }
+
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'role': normalizedRole,
+      'code_hash': codeHash,
+      'code_hint': codeHint,
+      if (label != null && label.trim().isNotEmpty) 'label': label.trim(),
+      if (maxUses != null && maxUses > 0) 'max_uses': maxUses,
+      if (expiresAt != null) 'expires_at': expiresAt.toUtc().toIso8601String(),
+    };
+
+    try {
+      final response = await _client
+          .from('company_join_codes')
+          .insert(payload)
+          .select(
+            'id, company_id, role, uses, max_uses, expires_at, revoked_at, created_at, code_hint, label',
+          )
+          .single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error.message);
+    } catch (error) {
+      return CommandResult<Map<String, dynamic>>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> revokeJoinCode({
+    required String codeId,
+  }) async {
+    try {
+      await _client.from('company_join_codes').update({
+        'revoked_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', codeId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteJoinCode({
+    required String codeId,
+  }) async {
+    try {
+      await _client.from('company_join_codes').delete().eq('id', codeId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> joinCompanyWithCode({
+    required String code,
+  }) async {
+    final trimmed = code.trim();
+    if (trimmed.isEmpty) {
+      return const CommandResult(error: 'Code requis.');
+    }
+
+    try {
+      await _client.functions.invoke(
+        'company-membership',
+        queryParameters: const {'route': 'join-code'},
+        body: {'code': trimmed},
+      );
+      return const CommandResult<void>(data: null);
+    } on FunctionException catch (error) {
+      final detail = error.details?.toString();
+      return CommandResult<void>(
+        error: detail?.isNotEmpty == true
+            ? detail
+            : error.reasonPhrase ?? 'Impossible de rejoindre cette entreprise.',
+      );
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+}

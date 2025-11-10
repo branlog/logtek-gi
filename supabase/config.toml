@@ -1,0 +1,17 @@
+[functions.shopify-auth]
+verify_jwt = false
+
+[functions.shopify-callback]
+verify_jwt = false
+
+[functions.shopify-login]
+verify_jwt = false
+
+[functions.shopify-signup]
+verify_jwt = false
+
+[functions.google-places-autocomplete]
+verify_jwt = false
+
+[functions.google-place-details]
+verify_jwt = false
