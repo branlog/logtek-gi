@@ -1,10 +1,9 @@
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
 class OpenAIConfig {
   const OpenAIConfig._();
 
-  static const String apiKey = String.fromEnvironment(
-    'OPENAI_API_KEY',
-    defaultValue: '',
-  );
+  static String get apiKey => dotenv.env['OPENAI_API_KEY'] ?? '';
 
   static bool get isConfigured => apiKey.isNotEmpty;
 }

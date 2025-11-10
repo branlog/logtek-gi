@@ -67,3 +67,9 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+.env
+flutter_app/env/*.json
+.vscode/launch.json
+.env
+flutter_app/env/*.json
+.vscode/launch.json
