@@ -343,6 +343,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           members: _overview?.members ?? const <Map<String, dynamic>>[],
           joinCodes: _joinCodes,
           invites: _invites,
+          userProfile: _userProfile,
           onRevokeCode: _handleRevokeJoinCode,
           onInviteMember: () => _showSnack('Invitations à venir.'),
         );
@@ -1067,6 +1068,633 @@ class _QuickActionButton extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// More tab
+// ---------------------------------------------------------------------------
+
+class _MoreTab extends StatelessWidget {
+  const _MoreTab({
+    required this.membership,
+    required this.members,
+    required this.joinCodes,
+    required this.invites,
+    required this.userProfile,
+    required this.onRevokeCode,
+    required this.onInviteMember,
+  });
+
+  final CompanyMembership membership;
+  final List<Map<String, dynamic>> members;
+  final List<CompanyJoinCode> joinCodes;
+  final List<MembershipInvite> invites;
+  final Map<String, dynamic>? userProfile;
+  final ValueChanged<CompanyJoinCode> onRevokeCode;
+  final VoidCallback onInviteMember;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _SectionCard(
+            title: 'Profil',
+            subtitle:
+                'Complète ton profil pour que tes collègues te reconnaissent.',
+            child: _ProfileSection(
+              membership: membership,
+              userProfile: userProfile,
+            ),
+          ),
+          _SectionCard(
+            title: 'Membres',
+            subtitle:
+                'Surveille les personnes ayant accès à l’entreprise.',
+            action: OutlinedButton.icon(
+              onPressed: onInviteMember,
+              icon: const Icon(Icons.person_add_alt_1),
+              label: const Text('Inviter'),
+            ),
+            child: _MembersSection(members: members),
+          ),
+          _SectionCard(
+            title: 'Entreprise',
+            subtitle: 'Récapitulatif et codes de connexion à partager.',
+            child: _CompanySection(
+              membership: membership,
+              joinCodes: joinCodes,
+              invites: invites,
+              onRevokeCode: onRevokeCode,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionCard extends StatelessWidget {
+  const _SectionCard({
+    required this.title,
+    required this.child,
+    this.subtitle,
+    this.action,
+  });
+
+  final String title;
+  final Widget child;
+  final String? subtitle;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      margin: const EdgeInsets.only(bottom: 20),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: theme.textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          subtitle!,
+                          style: theme.textTheme.bodyMedium
+                              ?.copyWith(color: Colors.black54),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (action != null) action!,
+              ],
+            ),
+            const SizedBox(height: 20),
+            child,
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ProfileSection extends StatelessWidget {
+  const _ProfileSection({
+    required this.membership,
+    required this.userProfile,
+  });
+
+  final CompanyMembership membership;
+  final Map<String, dynamic>? userProfile;
+
+  @override
+  Widget build(BuildContext context) {
+    final user = Supabase.instance.client.auth.currentUser;
+    final firstName = (userProfile?['first_name'] as String?)?.trim();
+    final lastName = (userProfile?['last_name'] as String?)?.trim();
+    final fullName = [firstName, lastName]
+        .where((value) => value != null && value!.isNotEmpty)
+        .map((value) => value!)
+        .join(' ');
+    final email = (userProfile?['email'] as String?)?.trim() ?? user?.email;
+    final role = membership.role ?? 'membre';
+    final roleLabel = role.isNotEmpty
+        ? role[0].toUpperCase() + role.substring(1)
+        : '—';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _InfoRow(
+          icon: Icons.person_outline,
+          label: 'Nom complet',
+          value: fullName.isNotEmpty ? fullName : 'Complète ton profil',
+        ),
+        const SizedBox(height: 12),
+        _InfoRow(
+          icon: Icons.alternate_email,
+          label: 'Courriel',
+          value: email ?? '—',
+        ),
+        const SizedBox(height: 12),
+        _InfoRow(
+          icon: Icons.verified_user_outlined,
+          label: 'Rôle',
+          value: roleLabel,
+        ),
+        const SizedBox(height: 16),
+        Text(
+          'Ces informations seront visibles par tes collègues.',
+          style:
+              Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54),
+        ),
+      ],
+    );
+  }
+}
+
+class _MembersSection extends StatelessWidget {
+  const _MembersSection({required this.members});
+
+  final List<Map<String, dynamic>> members;
+
+  @override
+  Widget build(BuildContext context) {
+    final highlighted = members.take(4).toList(growable: false);
+    final remaining = members.length - highlighted.length;
+
+    if (members.isEmpty) {
+      return const _EmptyStateCard(
+        title: 'Aucun membre',
+        subtitle: 'Invite tes collègues pour collaborer.',
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var index = 0; index < highlighted.length; index++) ...[
+          _MemberTile(member: highlighted[index]),
+          if (index != highlighted.length - 1)
+            const Divider(height: 24),
+        ],
+        if (remaining > 0) ...[
+          const SizedBox(height: 12),
+          Text(
+            '+$remaining membre${remaining > 1 ? 's' : ''} supplémentaire${remaining > 1 ? 's' : ''}',
+            style: Theme.of(context)
+                .textTheme
+                .bodyMedium
+                ?.copyWith(color: Colors.black54),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _MemberTile extends StatelessWidget {
+  const _MemberTile({required this.member});
+
+  final Map<String, dynamic> member;
+
+  @override
+  Widget build(BuildContext context) {
+    String pickField(String key) => member[key]?.toString().trim() ?? '';
+    final fullName = pickField('full_name');
+    final displayName = pickField('display_name');
+    final name = fullName.isNotEmpty ? fullName : displayName;
+    final email = pickField('email');
+    final role = pickField('role');
+    final status = pickField('status');
+    final initials = _buildInitials((name.isNotEmpty ? name : email).trim());
+
+    return Row(
+      children: [
+        CircleAvatar(
+          backgroundColor: AppColors.primary.withOpacity(0.15),
+          child: Text(
+            initials.isNotEmpty ? initials : '?',
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                name.isNotEmpty ? name : email,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodyLarge
+                    ?.copyWith(fontWeight: FontWeight.w600),
+              ),
+              Text(
+                email,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: Colors.black54),
+              ),
+            ],
+          ),
+        ),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (role.isNotEmpty)
+              Text(
+                role,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            if (status.isNotEmpty)
+              Text(
+                status,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: Colors.black54),
+              ),
+          ],
+        )
+      ],
+    );
+  }
+
+  String _buildInitials(String value) {
+    if (value.isEmpty) return '?';
+    final parts = value.split(RegExp(r'\s+')).where((part) => part.isNotEmpty);
+    final buffer = StringBuffer();
+    for (final part in parts.take(2)) {
+      final codeUnit = part.runes.isNotEmpty ? part.runes.first : null;
+      if (codeUnit != null) {
+        buffer.write(String.fromCharCode(codeUnit).toUpperCase());
+      }
+    }
+    return buffer.isEmpty ? '?' : buffer.toString();
+  }
+}
+
+class _CompanySection extends StatelessWidget {
+  const _CompanySection({
+    required this.membership,
+    required this.joinCodes,
+    required this.invites,
+    required this.onRevokeCode,
+  });
+
+  final CompanyMembership membership;
+  final List<CompanyJoinCode> joinCodes;
+  final List<MembershipInvite> invites;
+  final ValueChanged<CompanyJoinCode> onRevokeCode;
+
+  @override
+  Widget build(BuildContext context) {
+    final companyName =
+        membership.company?['name']?.toString() ?? 'Mon entreprise';
+    final role = membership.role ?? 'membre';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: AppColors.primary.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.business_center_outlined, color: AppColors.primary),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      companyName,
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w600),
+                    ),
+                    Text('Rôle : $role'),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        Text('Codes de connexion',
+            style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 12),
+        if (joinCodes.isEmpty)
+          const _EmptyStateCard(
+            title: 'Aucun code',
+            subtitle: 'Crée un code pour faciliter les nouvelles entrées.',
+          )
+        else
+          Column(
+            children: joinCodes
+                .take(3)
+                .map((code) => _JoinCodeCard(
+                      code: code,
+                      onRevoke: () => onRevokeCode(code),
+                    ))
+                .toList(),
+          ),
+        if (joinCodes.length > 3) ...[
+          const SizedBox(height: 8),
+          Text(
+            '+${joinCodes.length - 3} code${joinCodes.length - 3 > 1 ? 's' : ''} supplémentaires',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: Colors.black54),
+          ),
+        ],
+        const SizedBox(height: 20),
+        Text('Invitations récentes',
+            style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 12),
+        if (invites.isEmpty)
+          const _EmptyStateCard(
+            title: 'Aucune invitation',
+            subtitle: 'Tu n’as envoyé aucune invitation récemment.',
+          )
+        else
+          Column(
+            children: invites
+                .take(4)
+                .map((invite) => _InviteTile(invite: invite))
+                .toList(),
+          ),
+      ],
+    );
+  }
+}
+
+class _JoinCodeCard extends StatelessWidget {
+  const _JoinCodeCard({
+    required this.code,
+    required this.onRevoke,
+  });
+
+  final CompanyJoinCode code;
+  final VoidCallback onRevoke;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDisabled = code.isRevoked || code.isExpired;
+    final statusLabel = code.isRevoked
+        ? 'Révoqué'
+        : code.isExpired
+            ? 'Expiré'
+            : 'Actif';
+    final statusColor = code.isRevoked
+        ? Colors.red.shade100
+        : code.isExpired
+            ? Colors.orange.shade100
+            : Colors.green.shade100;
+    final usageText = code.maxUses != null
+        ? '${code.uses}/${code.maxUses} utilisation${code.maxUses == 1 ? '' : 's'}'
+        : '${code.uses} utilisation${code.uses > 1 ? 's' : ''}';
+    final remaining = code.remainingUses;
+    final expiresAt = code.expiresAt != null
+        ? DateFormat.yMMMMd().format(code.expiresAt!.toLocal())
+        : null;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        code.label?.isNotEmpty == true
+                            ? code.label!
+                            : 'Code ${code.codeHint ?? ''}',
+                        style: theme.textTheme.bodyLarge
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                      if (code.codeHint != null)
+                        Text('…${code.codeHint}',
+                            style: theme.textTheme.bodySmall
+                                ?.copyWith(color: Colors.black54)),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    statusLabel,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 12,
+              runSpacing: 4,
+              children: [
+                _InfoChip(icon: Icons.people_alt_outlined, text: usageText),
+                if (remaining != null)
+                  _InfoChip(
+                    icon: Icons.autorenew,
+                    text: '${remaining} restant${remaining > 1 ? 's' : ''}',
+                  ),
+                if (expiresAt != null)
+                  _InfoChip(
+                    icon: Icons.calendar_month,
+                    text: 'Expire le $expiresAt',
+                  ),
+                _InfoChip(
+                  icon: Icons.workspace_premium_outlined,
+                  text: code.role,
+                ),
+              ],
+            ),
+            if (!isDisabled) ...[
+              const SizedBox(height: 12),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: onRevoke,
+                  icon: const Icon(Icons.block),
+                  label: const Text('Révoquer'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _InviteTile extends StatelessWidget {
+  const _InviteTile({required this.invite});
+
+  final MembershipInvite invite;
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = DateFormat.yMMMd().format(invite.createdAt.toLocal());
+    Color chipColor;
+    String status;
+    if (invite.isPending) {
+      chipColor = Colors.orange.shade100;
+      status = 'En attente';
+    } else if (invite.isAccepted) {
+      chipColor = Colors.green.shade100;
+      status = 'Acceptée';
+    } else if (invite.isCancelled) {
+      chipColor = Colors.grey.shade200;
+      status = 'Annulée';
+    } else {
+      chipColor = Colors.red.shade100;
+      status = 'Erreur';
+    }
+
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        backgroundColor: AppColors.primary.withOpacity(0.12),
+        child: const Icon(Icons.mail_outline, color: AppColors.primary),
+      ),
+      title: Text(invite.email),
+      subtitle: Text('$subtitle • rôle ${invite.role}'),
+      trailing: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          color: chipColor,
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Text(status, style: const TextStyle(fontWeight: FontWeight.w600)),
+      ),
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  const _InfoRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, color: AppColors.primary),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style:
+                    theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+              ),
+              Text(
+                value,
+                style: theme.textTheme.bodyLarge,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _InfoChip extends StatelessWidget {
+  const _InfoChip({
+    required this.icon,
+    required this.text,
+  });
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: Colors.black54),
+          const SizedBox(width: 6),
+          Text(text, style: const TextStyle(fontWeight: FontWeight.w500)),
+        ],
       ),
     );
   }
