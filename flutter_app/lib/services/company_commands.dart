@@ -87,6 +87,115 @@ class CompanyCommands {
     }
   }
 
+  Future<CommandResult<Map<String, dynamic>>> updateWarehouse({
+    required String warehouseId,
+    required Map<String, dynamic> patch,
+  }) async {
+    try {
+      final response = await _client
+          .from('warehouses')
+          .update(patch)
+          .eq('id', warehouseId)
+          .select('id, name, code, active, created_at')
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Entrepôt introuvable ou déjà supprimé.',
+        );
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteWarehouse({
+    required String warehouseId,
+  }) async {
+    try {
+      await _client.from('warehouses').delete().eq('id', warehouseId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> createInventorySection({
+    required String companyId,
+    required String warehouseId,
+    required String name,
+    String? code,
+  }) async {
+    final payload = <String, dynamic>{
+      'company_id': companyId,
+      'warehouse_id': warehouseId,
+      'name': name.trim(),
+      if (code != null && code.trim().isNotEmpty) 'code': code.trim(),
+    };
+
+    try {
+      final response = await _client
+          .from('inventory_sections')
+          .insert(payload)
+          .select(
+            'id, name, code, active, warehouse_id, company_id, created_at',
+          )
+          .single();
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteInventorySection({
+    required String sectionId,
+  }) async {
+    try {
+      await _client.from('inventory_sections').delete().eq('id', sectionId);
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> updateInventorySection({
+    required String sectionId,
+    required Map<String, dynamic> patch,
+  }) async {
+    try {
+      final response = await _client
+          .from('inventory_sections')
+          .update(patch)
+          .eq('id', sectionId)
+          .select('id, name, code, warehouse_id, active, created_at')
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Section introuvable ou déjà supprimée.',
+        );
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
   Future<CommandResult<Map<String, dynamic>>> createItem({
     required String companyId,
     required String name,
@@ -144,16 +253,20 @@ class CompanyCommands {
     required String itemId,
     required String warehouseId,
     required int delta,
+    String? sectionId,
   }) async {
     if (delta == 0) {
       try {
-        final existing = await _client
+        var query = _client
             .from('stock')
             .select('qty')
             .eq('company_id', companyId)
             .eq('item_id', itemId)
-            .eq('warehouse_id', warehouseId)
-            .maybeSingle();
+            .eq('warehouse_id', warehouseId);
+        query = sectionId == null
+            ? query.filter('section_id', 'is', null)
+            : query.eq('section_id', sectionId);
+        final existing = await query.maybeSingle();
         final currentQty =
             existing == null ? 0 : ((existing['qty'] as num?)?.round() ?? 0);
         return CommandResult<int>(data: currentQty);
@@ -165,13 +278,16 @@ class CompanyCommands {
     }
 
     try {
-      final existing = await _client
+      var selectQuery = _client
           .from('stock')
           .select('id, qty')
           .eq('company_id', companyId)
           .eq('item_id', itemId)
-          .eq('warehouse_id', warehouseId)
-          .maybeSingle();
+          .eq('warehouse_id', warehouseId);
+      selectQuery = sectionId == null
+          ? selectQuery.filter('section_id', 'is', null)
+          : selectQuery.eq('section_id', sectionId);
+      final existing = await selectQuery.maybeSingle();
 
       final currentQty =
           existing == null ? 0 : ((existing['qty'] as num?)?.round() ?? 0);
@@ -194,11 +310,12 @@ class CompanyCommands {
           'company_id': companyId,
           'item_id': itemId,
           'warehouse_id': warehouseId,
+          'section_id': sectionId,
           'qty': newQty,
           'updated_at': DateTime.now().toUtc().toIso8601String(),
         });
       } else {
-        await _client
+        var updateQuery = _client
             .from('stock')
             .update({
               'qty': newQty,
@@ -207,6 +324,10 @@ class CompanyCommands {
             .eq('company_id', companyId)
             .eq('item_id', itemId)
             .eq('warehouse_id', warehouseId);
+        updateQuery = sectionId == null
+            ? updateQuery.filter('section_id', 'is', null)
+            : updateQuery.eq('section_id', sectionId);
+        await updateQuery;
       }
 
       return CommandResult<int>(data: newQty);
@@ -222,12 +343,14 @@ class CompanyCommands {
     required String itemId,
     required String warehouseId,
     required int qty,
+    String? sectionId,
   }) async {
     return applyStockDelta(
       companyId: companyId,
       itemId: itemId,
       warehouseId: warehouseId,
       delta: qty,
+      sectionId: sectionId,
     );
   }
 
@@ -269,7 +392,7 @@ class CompanyCommands {
           .update({'meta': meta})
           .eq('id', equipmentId)
           .select(
-            'id, name, brand, model, serial, active, meta, created_at',
+            'id, company_id, name, brand, model, serial, active, meta, created_at',
           )
           .maybeSingle();
       if (response == null) {
@@ -287,11 +410,58 @@ class CompanyCommands {
     }
   }
 
+  Future<void> logJournalEntry({
+    required String companyId,
+    required String scope,
+    String? entityId,
+    required String event,
+    Map<String, dynamic>? payload,
+    String? note,
+  }) async {
+    final currentUser = _client.auth.currentUser;
+    final entry = <String, dynamic>{
+      'company_id': companyId,
+      'scope': scope,
+      'event': event,
+      if (entityId != null) 'entity_id': entityId,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+      if (payload != null && payload.isNotEmpty) 'payload': payload,
+      if (currentUser != null) 'created_by': currentUser.id,
+    };
+    try {
+      await _client.from('journal_entries').insert(entry);
+    } catch (_) {
+      // journal logging is best-effort
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchJournalEntries({
+    required String companyId,
+    required String scope,
+    String? entityId,
+    int limit = 50,
+  }) async {
+    var query = _client
+        .from('journal_entries')
+        .select(
+          'id, scope, entity_id, event, note, payload, created_at, created_by',
+        )
+        .eq('company_id', companyId)
+        .eq('scope', scope);
+    if (entityId != null && entityId.isNotEmpty) {
+      query = query.eq('entity_id', entityId);
+    }
+    final response =
+        await query.order('created_at', ascending: false).limit(limit);
+    return (response as List).cast<Map<String, dynamic>>();
+  }
+
   Future<CommandResult<Map<String, dynamic>>> createPurchaseRequest({
     required String companyId,
     required String name,
     required int qty,
     String? warehouseId,
+    String? sectionId,
     String? note,
   }) async {
     final currentUser = _client.auth.currentUser;
@@ -306,6 +476,7 @@ class CompanyCommands {
       'qty': qty,
       if (warehouseId != null && warehouseId.isNotEmpty)
         'warehouse_id': warehouseId,
+      if (sectionId != null && sectionId.isNotEmpty) 'section_id': sectionId,
       if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
     };
 
@@ -314,7 +485,7 @@ class CompanyCommands {
           .from('purchase_requests')
           .insert(payload)
           .select(
-            'id, name, qty, note, status, item_id, warehouse_id, purchased_at, created_at, warehouse:warehouses(id, name)',
+            'id, name, qty, note, status, item_id, warehouse_id, section_id, purchased_at, created_at, warehouse:warehouses(id, name), section:inventory_sections(id, name, warehouse_id)',
           )
           .single();
 
@@ -338,7 +509,7 @@ class CompanyCommands {
           .update(patch)
           .eq('id', requestId)
           .select(
-            'id, name, qty, note, status, item_id, warehouse_id, purchased_at, created_at, warehouse:warehouses(id, name)',
+            'id, name, qty, note, status, item_id, warehouse_id, section_id, purchased_at, created_at, warehouse:warehouses(id, name), section:inventory_sections(id, name, warehouse_id)',
           )
           .maybeSingle();
 

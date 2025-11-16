@@ -48,20 +48,26 @@ class InventoryEntry {
     required this.item,
     this.totalQty = 0,
     this.warehouseSplit = const <String, int>{},
+    this.sectionSplit = const <String, Map<String, int>>{},
   });
+
+  static const String unassignedSectionKey = '__unassigned__';
 
   final Map<String, dynamic> item;
   final int totalQty;
   final Map<String, int> warehouseSplit;
+  final Map<String, Map<String, int>> sectionSplit;
 
   InventoryEntry copyWith({
     int? totalQty,
     Map<String, int>? warehouseSplit,
+    Map<String, Map<String, int>>? sectionSplit,
   }) {
     return InventoryEntry(
       item: item,
       totalQty: totalQty ?? this.totalQty,
       warehouseSplit: warehouseSplit ?? this.warehouseSplit,
+      sectionSplit: sectionSplit ?? this.sectionSplit,
     );
   }
 }
@@ -145,8 +151,7 @@ class CompanyRepository {
       );
     }
 
-    final overview =
-        CompanyOverview(membership: membership, members: members);
+    final overview = CompanyOverview(membership: membership, members: members);
     await _saveCacheForCurrentUser(
       OfflineCacheKeys.companyOverview,
       _companyOverviewToJson(overview),
@@ -188,7 +193,7 @@ class CompanyRepository {
       final response = await _client
           .from('warehouses')
           .select(
-            'id, name, code, active, created_at',
+            'id, name, code, active, created_at, sections:inventory_sections(id, name, code, active, created_at)',
           )
           .eq('company_id', companyId)
           .order('name');
@@ -316,23 +321,31 @@ class CompanyRepository {
     try {
       final stockRows = await _client
           .from('stock')
-          .select('item_id, warehouse_id, qty')
+          .select('item_id, warehouse_id, section_id, qty')
           .eq('company_id', companyId);
       final rows = (stockRows as List).cast<Map<String, dynamic>>();
 
-      final grouped = <String, Map<String, int>>{};
+      final grouped = <String, Map<String, _InventoryWarehouseSplit>>{};
       for (final row in rows) {
         final itemId = row['item_id'] as String?;
-        if (itemId == null) continue;
-        final warehouseId = row['warehouse_id'] as String? ?? 'warehouse';
+        final warehouseId = row['warehouse_id'] as String?;
+        if (itemId == null || warehouseId == null) continue;
         final rawQty = row['qty'];
         final qty =
             rawQty is num ? rawQty.round() : int.tryParse('$rawQty') ?? 0;
+        if (qty == 0) continue;
+        final sectionId = row['section_id'] as String?;
+        final sectionKey = sectionId ?? InventoryEntry.unassignedSectionKey;
         final perWarehouse = grouped.putIfAbsent(
           itemId,
-          () => <String, int>{},
+          () => <String, _InventoryWarehouseSplit>{},
         );
-        perWarehouse[warehouseId] = (perWarehouse[warehouseId] ?? 0) + qty;
+        final split = perWarehouse.putIfAbsent(
+          warehouseId,
+          () => _InventoryWarehouseSplit(),
+        );
+        split.total += qty;
+        split.sections[sectionKey] = (split.sections[sectionKey] ?? 0) + qty;
       }
 
       entries = entries.map((entry) {
@@ -341,13 +354,19 @@ class CompanyRepository {
         final splits = grouped[itemId];
         if (splits == null) return entry;
 
-        final total = splits.values.fold<int>(
-          0,
-          (acc, value) => acc + value,
-        );
+        final warehouseTotals = <String, int>{};
+        final sectionTotals = <String, Map<String, int>>{};
+        var total = 0;
+        splits.forEach((warehouseId, data) {
+          warehouseTotals[warehouseId] = data.total;
+          sectionTotals[warehouseId] = Map<String, int>.from(data.sections);
+          total += data.total;
+        });
+
         return entry.copyWith(
           totalQty: total,
-          warehouseSplit: splits,
+          warehouseSplit: warehouseTotals,
+          sectionSplit: sectionTotals,
         );
       }).toList(growable: false);
     } on PostgrestException catch (error) {
@@ -463,7 +482,7 @@ class CompanyRepository {
       final response = await _client
           .from('equipment')
           .select(
-            'id, name, brand, model, serial, active, meta, created_at',
+            'id, company_id, name, brand, model, serial, active, meta, created_at',
           )
           .eq('company_id', companyId)
           .order('name');
@@ -520,6 +539,59 @@ class CompanyRepository {
     }
   }
 
+  Future<RepositoryResult<List<Map<String, dynamic>>>> fetchJournalEntries({
+    required String scope,
+    String? entityId,
+    int limit = 50,
+  }) async {
+    final membershipResult = await _fetchMembership();
+    if (membershipResult.hasMissingTables || membershipResult.hasError) {
+      return RepositoryResult<List<Map<String, dynamic>>>(
+        data: const <Map<String, dynamic>>[],
+        missingTables: membershipResult.missingTables,
+        error: membershipResult.error,
+      );
+    }
+
+    final membership = membershipResult.data;
+    if (membership?.companyId == null) {
+      return const RepositoryResult<List<Map<String, dynamic>>>(
+        data: <Map<String, dynamic>>[],
+      );
+    }
+    final companyId = membership!.companyId!;
+
+    try {
+      var query = _client
+          .from('journal_entries')
+          .select(
+            'id, scope, entity_id, event, note, payload, created_at, created_by',
+          )
+          .eq('company_id', companyId)
+          .eq('scope', scope);
+      if (entityId != null && entityId.isNotEmpty) {
+        query = query.eq('entity_id', entityId);
+      }
+      final response =
+          await query.order('created_at', ascending: false).limit(limit);
+      final rows = (response as List).cast<Map<String, dynamic>>();
+      return RepositoryResult<List<Map<String, dynamic>>>(data: rows);
+    } on PostgrestException catch (error) {
+      if (_isMissingTable(error)) {
+        final missing =
+            _extractMissingTable(error.message) ?? 'journal_entries';
+        return RepositoryResult<List<Map<String, dynamic>>>(
+          data: const <Map<String, dynamic>>[],
+          missingTables: <String>[missing],
+        );
+      }
+      return RepositoryResult<List<Map<String, dynamic>>>(
+        data: const <Map<String, dynamic>>[],
+        error: error,
+      );
+    }
+  }
+
   Future<RepositoryResult<List<Map<String, dynamic>>>>
       fetchPurchaseRequests() async {
     final membershipResult = await _fetchMembership();
@@ -552,7 +624,7 @@ class CompanyRepository {
       final response = await _client
           .from('purchase_requests')
           .select(
-            'id, name, qty, note, status, item_id, warehouse_id, purchased_at, created_at, warehouse:warehouses(id, name)',
+            'id, name, qty, note, status, item_id, warehouse_id, section_id, purchased_at, created_at, warehouse:warehouses(id, name), section:inventory_sections(id, name, warehouse_id)',
           )
           .eq('company_id', companyId)
           .order('status')
@@ -778,6 +850,7 @@ class CompanyRepository {
             'item': entry.item,
             'totalQty': entry.totalQty,
             'warehouseSplit': entry.warehouseSplit,
+            'sectionSplit': entry.sectionSplit,
           },
         )
         .toList(growable: false);
@@ -794,6 +867,7 @@ class CompanyRepository {
             ),
             totalQty: (map['totalQty'] as num?)?.round() ?? 0,
             warehouseSplit: _decodeWarehouseSplit(map['warehouseSplit']),
+            sectionSplit: _decodeSectionSplit(map['sectionSplit']),
           ),
         )
         .toList(growable: false);
@@ -810,6 +884,17 @@ class CompanyRepository {
     );
   }
 
+  Map<String, Map<String, int>> _decodeSectionSplit(dynamic input) {
+    final map = _coerceMap(input);
+    if (map == null) return const <String, Map<String, int>>{};
+    final result = <String, Map<String, int>>{};
+    map.forEach((warehouseId, rawSections) {
+      if (warehouseId.isEmpty) return;
+      result[warehouseId] = _decodeWarehouseSplit(rawSections);
+    });
+    return result;
+  }
+
   Map<String, dynamic>? _coerceMap(dynamic input) {
     if (input is Map<String, dynamic>) return input;
     if (input is Map) {
@@ -819,4 +904,9 @@ class CompanyRepository {
     }
     return null;
   }
+}
+
+class _InventoryWarehouseSplit {
+  int total = 0;
+  final Map<String, int> sections = <String, int>{};
 }

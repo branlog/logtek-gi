@@ -127,13 +127,13 @@ class App extends StatelessWidget {
             }),
             overlayColor: WidgetStateProperty.resolveWith((states) {
               if (states.contains(WidgetState.pressed)) {
-                return AppColors.primaryPressed.withOpacity(0.12);
+                return AppColors.primaryPressed.withValues(alpha: 0.12);
               }
               if (states.contains(WidgetState.hovered)) {
-                return AppColors.primaryHover.withOpacity(0.08);
+                return AppColors.primaryHover.withValues(alpha: 0.08);
               }
               if (states.contains(WidgetState.focused)) {
-                return AppColors.primary.withOpacity(0.12);
+                return AppColors.primary.withValues(alpha: 0.12);
               }
               return null;
             }),
@@ -170,13 +170,13 @@ class App extends StatelessWidget {
             }),
             overlayColor: WidgetStateProperty.resolveWith((states) {
               if (states.contains(WidgetState.pressed)) {
-                return AppColors.primaryPressed.withOpacity(0.12);
+                return AppColors.primaryPressed.withValues(alpha: 0.12);
               }
               if (states.contains(WidgetState.hovered)) {
-                return AppColors.primaryHover.withOpacity(0.06);
+                return AppColors.primaryHover.withValues(alpha: 0.06);
               }
               if (states.contains(WidgetState.focused)) {
-                return AppColors.primary.withOpacity(0.12);
+                return AppColors.primary.withValues(alpha: 0.12);
               }
               return null;
             }),
