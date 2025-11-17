@@ -13,6 +13,7 @@ class OfflineCacheKeys {
   static const inventory = 'inventory';
   static const purchaseRequests = 'purchase_requests';
   static const journalEntries = 'journal_entries';
+  static const equipment = 'equipment';
 }
 
 class PendingAction {

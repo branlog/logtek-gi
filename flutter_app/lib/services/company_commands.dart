@@ -382,6 +382,89 @@ class CompanyCommands {
     }
   }
 
+  Future<CommandResult<Map<String, dynamic>>> updateEquipment({
+    required String equipmentId,
+    String? name,
+    String? brand,
+    String? model,
+    String? serial,
+    bool? active,
+  }) async {
+    final payload = <String, dynamic>{};
+
+    if (name != null) {
+      final trimmed = name.trim();
+      if (trimmed.isEmpty) {
+        return const CommandResult(error: 'Nom requis.');
+      }
+      payload['name'] = trimmed;
+    }
+
+    void handleOptional(String key, String? value) {
+      if (value != null) {
+        final trimmed = value.trim();
+        payload[key] = trimmed.isEmpty ? null : trimmed;
+      }
+    }
+
+    handleOptional('brand', brand);
+    handleOptional('model', model);
+    handleOptional('serial', serial);
+    if (active != null) {
+      payload['active'] = active;
+    }
+
+    if (payload.isEmpty) {
+      return const CommandResult(error: 'Aucune modification fournie.');
+    }
+
+    try {
+      final response = await _client
+          .from('equipment')
+          .update(payload)
+          .eq('id', equipmentId)
+          .select(
+            'id, company_id, name, brand, model, serial, active, meta, created_at',
+          )
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Équipement introuvable ou déjà supprimé.',
+        );
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteEquipment({
+    required String equipmentId,
+  }) async {
+    try {
+      final response = await _client
+          .from('equipment')
+          .delete()
+          .eq('id', equipmentId)
+          .select('id')
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Équipement introuvable ou déjà supprimé.',
+        );
+      }
+      return const CommandResult<void>(data: null);
+    } on PostgrestException catch (error) {
+      return CommandResult<void>(error: error.message);
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
   Future<CommandResult<Map<String, dynamic>>> updateEquipmentMeta({
     required String equipmentId,
     required Map<String, dynamic> meta,

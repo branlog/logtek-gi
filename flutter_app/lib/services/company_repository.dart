@@ -458,6 +458,15 @@ class CompanyRepository {
   Future<RepositoryResult<List<Map<String, dynamic>>>> fetchEquipment() async {
     final membershipResult = await _fetchMembership();
     if (membershipResult.hasMissingTables || membershipResult.hasError) {
+      final cached =
+          await _readCachedMapList(OfflineCacheKeys.equipment);
+      if (cached != null) {
+        return RepositoryResult<List<Map<String, dynamic>>>(
+          data: cached,
+          missingTables: membershipResult.missingTables,
+          error: membershipResult.error,
+        );
+      }
       return RepositoryResult<List<Map<String, dynamic>>>(
         data: const <Map<String, dynamic>>[],
         missingTables: membershipResult.missingTables,
@@ -468,9 +477,11 @@ class CompanyRepository {
     final membership = membershipResult.data;
     if (membership?.companyId == null) {
       final cached =
-          await _readCachedMapList(OfflineCacheKeys.purchaseRequests);
+          await _readCachedMapList(OfflineCacheKeys.equipment);
       if (cached != null) {
-        return RepositoryResult<List<Map<String, dynamic>>>(data: cached);
+        return RepositoryResult<List<Map<String, dynamic>>>(
+          data: cached,
+        );
       }
       return const RepositoryResult<List<Map<String, dynamic>>>(
         data: <Map<String, dynamic>>[],
@@ -487,6 +498,7 @@ class CompanyRepository {
           .eq('company_id', companyId)
           .order('name');
       final rows = (response as List).cast<Map<String, dynamic>>();
+      await _saveCacheForCurrentUser(OfflineCacheKeys.equipment, rows);
 
       return RepositoryResult<List<Map<String, dynamic>>>(
         data: rows,
@@ -497,6 +509,27 @@ class CompanyRepository {
         return RepositoryResult<List<Map<String, dynamic>>>(
           data: const <Map<String, dynamic>>[],
           missingTables: <String>[missing],
+        );
+      }
+      final cached =
+          await _readCachedMapList(OfflineCacheKeys.equipment);
+      if (cached != null) {
+        return RepositoryResult<List<Map<String, dynamic>>>(
+          data: cached,
+          error: error,
+        );
+      }
+      return RepositoryResult<List<Map<String, dynamic>>>(
+        data: const <Map<String, dynamic>>[],
+        error: error,
+      );
+    } catch (error) {
+      final cached =
+          await _readCachedMapList(OfflineCacheKeys.equipment);
+      if (cached != null) {
+        return RepositoryResult<List<Map<String, dynamic>>>(
+          data: cached,
+          error: error,
         );
       }
       return RepositoryResult<List<Map<String, dynamic>>>(

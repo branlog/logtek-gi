@@ -9,6 +9,7 @@ import 'config/openai_config.dart';
 import 'pages/company_gate.dart';
 import 'pages/sign_in_page.dart';
 import 'services/connectivity_service.dart';
+import 'services/offline_actions_service.dart';
 import 'services/offline_storage.dart';
 import 'services/supabase_service.dart';
 import 'theme/app_colors.dart';
@@ -30,6 +31,7 @@ void main() async {
 
   await OfflineStorage.instance.init();
   await ConnectivityService.instance.init();
+  await OfflineActionsService.instance.init();
 
   runApp(const App());
 }

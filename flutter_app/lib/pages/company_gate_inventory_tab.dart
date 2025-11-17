@@ -300,6 +300,7 @@ class _WarehouseInventoryPage extends StatefulWidget {
     required this.commands,
     required this.describeError,
     required this.onRefresh,
+    required this.isOnline,
     this.initialSectionId,
     this.onShowJournal,
     this.onManageWarehouse,
@@ -313,6 +314,7 @@ class _WarehouseInventoryPage extends StatefulWidget {
   final CompanyCommands commands;
   final String? Function(Object? error) describeError;
   final Future<void> Function() onRefresh;
+  final bool Function() isOnline;
   final String? initialSectionId;
   final Future<void> Function({String? scopeOverride, String? entityId})?
       onShowJournal;
@@ -327,6 +329,10 @@ class _WarehouseInventoryPage extends StatefulWidget {
 class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
   String? _focusedSectionId;
   bool _processing = false;
+  final Map<String, _SectionSnapshot> _offlineSectionOverrides =
+      <String, _SectionSnapshot>{};
+
+  bool get _isOnline => widget.isOnline();
 
   @override
   void initState() {
@@ -551,6 +557,23 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
   }
 
   List<_SectionSnapshot> _buildSections() {
+    final base = _composeSections();
+    if (_offlineSectionOverrides.isEmpty) return base;
+    final resolved = base
+        .map((snapshot) =>
+            _offlineSectionOverrides[_sectionKey(snapshot.id)] ?? snapshot)
+        .toList(growable: true);
+    _offlineSectionOverrides.forEach((key, snapshot) {
+      final exists =
+          resolved.any((section) => _sectionKey(section.id) == key);
+      if (!exists) {
+        resolved.add(snapshot);
+      }
+    });
+    return resolved;
+  }
+
+  List<_SectionSnapshot> _composeSections() {
     final linesBySection = <String?, List<_InventoryBreakdownLine>>{};
     for (final entry in _inventory) {
       final itemId = entry.item['id']?.toString();
@@ -755,7 +778,8 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
   Future<void> _handleAddPieces(String? sectionId) async {
     final request = await _promptAddPiecesDialog(sectionId: sectionId);
     if (request == null) return;
-    final resolved = await _resolveItemForRequest(request);
+    final resolved =
+        await _resolveItemForRequest(request, allowCreate: _isOnline);
     if (resolved == null) return;
     await _applyStockDelta(
       itemId: resolved.itemId,
@@ -765,6 +789,8 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
           resolved.created ? 'Pièce créée et ajoutée.' : 'Pièce ajoutée.',
       action: 'add_dialog',
       note: request.note,
+      itemName: request.name,
+      sku: request.sku,
       metadata: {
         'source': resolved.created ? 'new_item' : 'existing_item',
         'requested_qty': request.qty,
@@ -792,6 +818,8 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
       successMessage:
           increase ? 'Stock ajouté.' : 'Stock retiré de cette section.',
       action: increase ? 'manual_add' : 'manual_remove',
+      itemName: line.name,
+      sku: line.sku,
       metadata: {
         'trigger': 'adjust_dialog',
       },
@@ -813,6 +841,8 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
       sectionId: sectionId,
       successMessage: increase ? 'Pièce ajoutée.' : 'Pièce retirée.',
       action: increase ? 'quick_add' : 'quick_remove',
+      itemName: line.name,
+      sku: line.sku,
       metadata: {
         'trigger': 'quick_tap',
       },
@@ -912,10 +942,26 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
     required int delta,
     required String? sectionId,
     required String successMessage,
+    required String itemName,
+    String? sku,
     String action = 'manual',
     String? note,
     Map<String, dynamic>? metadata,
   }) async {
+    if (!_isOnline) {
+      await _queueOfflineStockDelta(
+        itemId: itemId,
+        delta: delta,
+        sectionId: sectionId,
+        successMessage: successMessage,
+        itemName: itemName,
+        sku: sku,
+        action: action,
+        note: note,
+        metadata: metadata,
+      );
+      return;
+    }
     setState(() => _processing = true);
     final result = await widget.commands.applyStockDelta(
       companyId: widget.companyId,
@@ -953,6 +999,116 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
     _showSnack(successMessage);
   }
 
+  Future<void> _queueOfflineStockDelta({
+    required String itemId,
+    required int delta,
+    required String? sectionId,
+    required String successMessage,
+    required String itemName,
+    String? sku,
+    String action = 'manual',
+    String? note,
+    Map<String, dynamic>? metadata,
+  }) async {
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.inventoryStockDelta,
+      {
+        'company_id': widget.companyId,
+        'warehouse_id': widget.warehouseId,
+        'item_id': itemId,
+        'delta': delta,
+        'section_id': _dbSectionId(sectionId),
+        'note': note,
+        'action': action,
+        'metadata': metadata,
+        'event': 'stock_delta',
+      },
+    );
+    _applyLocalStockDelta(
+      itemId: itemId,
+      itemName: itemName,
+      delta: delta,
+      sectionId: sectionId,
+      sku: sku,
+    );
+    _showSnack('$successMessage (hors ligne).');
+  }
+
+  void _applyLocalStockDelta({
+    required String itemId,
+    required String itemName,
+    required int delta,
+    required String? sectionId,
+    String? sku,
+  }) {
+    final key = _sectionKey(sectionId);
+    final base = _offlineSectionOverrides[key] ?? _resolveBaseSection(sectionId);
+    final lines = base.lines.map((line) => line).toList();
+    final index = lines.indexWhere((line) => line.itemId == itemId);
+    if (index >= 0) {
+      final line = lines[index];
+      final newQty = line.qty + delta;
+      if (newQty <= 0) {
+        lines.removeAt(index);
+      } else {
+        lines[index] = line.copyWith(qty: newQty);
+      }
+    } else if (delta > 0) {
+      lines.add(
+        _InventoryBreakdownLine(
+          itemId: itemId,
+          name: itemName,
+          sku: sku,
+          qty: delta,
+          unit: null,
+        ),
+      );
+    }
+    _offlineSectionOverrides[key] =
+        base.copyWith(lines: List<_InventoryBreakdownLine>.from(lines));
+    setState(() {});
+  }
+
+  _SectionSnapshot _resolveBaseSection(String? sectionId) {
+    final key = _sectionKey(sectionId);
+    final sections = _composeSections();
+    final match = sections.firstWhere(
+      (section) => _sectionKey(section.id) == key,
+      orElse: () => _SectionSnapshot(
+        id: sectionId ?? InventoryEntry.unassignedSectionKey,
+        label: sectionId == null ? 'Sans section' : 'Section',
+        lines: const <_InventoryBreakdownLine>[],
+        deletable: sectionId != null,
+        renamable: sectionId != null,
+      ),
+    );
+    return match;
+  }
+
+  Future<void> _queueOfflineDeleteItem(
+    _InventoryBreakdownLine line, {
+    required String? sectionId,
+  }) async {
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.inventoryDeleteItem,
+      {
+        'company_id': widget.companyId,
+        'warehouse_id': widget.warehouseId,
+        'item_id': line.itemId,
+        'section_id': _dbSectionId(sectionId),
+        'note': line.name,
+      },
+    );
+    _applyLocalStockDelta(
+      itemId: line.itemId,
+      itemName: line.name,
+      delta: -line.qty,
+      sectionId: sectionId,
+      sku: line.sku,
+    );
+    _showSnack('Pièce supprimée (hors ligne).');
+  }
+
   Future<void> _handleDeleteItem(
     _InventoryBreakdownLine line, {
     required String? sectionId,
@@ -977,6 +1133,14 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
       ),
     );
     if (confirm != true) return;
+
+    if (!_isOnline) {
+      await _queueOfflineDeleteItem(
+        line,
+        sectionId: sectionId,
+      );
+      return;
+    }
 
     setState(() => _processing = true);
     final result = await widget.commands.deleteItem(
@@ -1010,164 +1174,22 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
   Future<void> _handleFullRefresh() async {
     await widget.onRefresh();
     if (mounted) {
-      setState(() {});
+      setState(() {
+        if (_isOnline) {
+          _offlineSectionOverrides.clear();
+        }
+      });
     }
   }
 
   Future<void> _showSectionDetails(_SectionSnapshot snapshot) async {
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            final sections = _buildSections();
-            final section = sections.firstWhere(
-              (candidate) => candidate.id == snapshot.id,
-              orElse: () => snapshot,
-            );
-            final bottomPadding = MediaQuery.of(context).viewInsets.bottom;
-            final canMove = _hasMoveDestinations(section.id);
-
-            return FractionallySizedBox(
-              heightFactor: 0.9,
-              child: Padding(
-                padding: EdgeInsets.only(
-                  left: 20,
-                  right: 20,
-                  top: 24,
-                  bottom: bottomPadding + 24,
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                section.label,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .titleLarge
-                                    ?.copyWith(fontWeight: FontWeight.w700),
-                              ),
-                              Text('${section.totalQty} pièce(s)'),
-                            ],
-                          ),
-                        ),
-                        if (section.renamable || section.deletable)
-                          IconButton(
-                            tooltip: 'Gérer la section',
-                            onPressed: () async {
-                              await _showSectionActions(
-                                section,
-                                onChanged: () => setSheetState(() {}),
-                              );
-                            },
-                            icon: const Icon(Icons.more_horiz),
-                          ),
-                        if (widget.onShowJournal != null)
-                          IconButton(
-                            tooltip: 'Journal',
-                            onPressed: () =>
-                                _openSectionJournal(section.id),
-                            icon: const Icon(Icons.history),
-                          ),
-                        IconButton(
-                          onPressed: () => Navigator.of(context).pop(),
-                          icon: const Icon(Icons.close),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: FloatingActionButton.small(
-                        heroTag: 'section_add_${section.id ?? 'none'}',
-                        onPressed: _processing
-                            ? null
-                            : () async {
-                                await _handleAddPieces(section.id);
-                                if (mounted) setSheetState(() {});
-                              },
-                        tooltip: 'Ajouter une pièce',
-                        child: const Icon(Icons.add),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Expanded(
-                      child: section.lines.isEmpty
-                          ? const Center(
-                              child: Text('Aucune pièce dans cette section.'),
-                            )
-                          : ListView.separated(
-                              itemCount: section.lines.length,
-                              separatorBuilder: (_, __) =>
-                                  const Divider(height: 1),
-                              itemBuilder: (context, index) {
-                                final line = section.lines[index];
-                                return _InventoryLineRow(
-                                  line: line,
-                                  busy: _processing,
-                                  onIncrement: () async {
-                                    await _handleQuickAdjust(
-                                      section.id,
-                                      line,
-                                      increase: true,
-                                    );
-                                    if (mounted) setSheetState(() {});
-                                  },
-                                  onDecrement: () async {
-                                    await _handleQuickAdjust(
-                                      section.id,
-                                      line,
-                                      increase: false,
-                                    );
-                                    if (mounted) setSheetState(() {});
-                                  },
-                                  onDelete: () async {
-                                    await _handleDeleteItem(
-                                      line,
-                                      sectionId: section.id,
-                                    );
-                                    if (mounted) setSheetState(() {});
-                                  },
-                                  onMove: canMove
-                                      ? () async {
-                                          await _handleMoveStock(
-                                            section.id,
-                                            line,
-                                          );
-                                          if (mounted) setSheetState(() {});
-                                        }
-                                      : null,
-                                );
-                              },
-                            ),
-                    ),
-                    if (section.deletable)
-                      TextButton.icon(
-                        onPressed: _processing
-                            ? null
-                            : () async {
-                                await _handleDeleteSection(section.id!);
-                                Navigator.of(context).pop();
-                              },
-                        icon: const Icon(Icons.delete_outline),
-                        label: const Text('Supprimer cette section'),
-                        style:
-                            TextButton.styleFrom(foregroundColor: Colors.red),
-                      ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _SectionDetailPage(
+          parent: this,
+          initialSnapshot: snapshot,
+        ),
+      ),
     );
   }
 
@@ -1500,9 +1522,14 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
     return sectionId;
   }
 
+  String _sectionKey(String? sectionId) {
+    return sectionId ?? InventoryEntry.unassignedSectionKey;
+  }
+
   Future<_ResolvedItem?> _resolveItemForRequest(
-    _AddStockRequest request,
-  ) async {
+    _AddStockRequest request, {
+    bool allowCreate = true,
+  }) async {
     final name = request.name.trim();
     if (name.isEmpty) {
       _showSnack('Nom requis.', error: true);
@@ -1517,6 +1544,14 @@ class _WarehouseInventoryPageState extends State<_WarehouseInventoryPage> {
           entryName.trim().toLowerCase() == normalized) {
         return _ResolvedItem(itemId: entryId, created: false);
       }
+    }
+
+    if (!allowCreate) {
+      _showSnack(
+        'Connexion requise pour créer une nouvelle pièce.',
+        error: true,
+      );
+      return null;
     }
 
     final result = await widget.commands.createItem(
@@ -1609,6 +1644,195 @@ class _SectionInventoryCard extends StatelessWidget {
     );
   }
 }
+
+class _SectionDetailPage extends StatefulWidget {
+  const _SectionDetailPage({
+    required this.parent,
+    required this.initialSnapshot,
+  });
+
+  final _WarehouseInventoryPageState parent;
+  final _SectionSnapshot initialSnapshot;
+
+  @override
+  State<_SectionDetailPage> createState() => _SectionDetailPageState();
+}
+
+class _SectionDetailPageState extends State<_SectionDetailPage> {
+  late String? _sectionId;
+  late _SectionSnapshot _lastSnapshot;
+  final TextEditingController _searchCtrl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _sectionId = widget.initialSnapshot.id;
+    _lastSnapshot = widget.initialSnapshot;
+    _searchCtrl.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  _SectionSnapshot _currentSection() {
+    final sections = widget.parent._buildSections();
+    final match = sections.firstWhere(
+      (candidate) => candidate.id == _sectionId,
+      orElse: () => _lastSnapshot,
+    );
+    _lastSnapshot = match;
+    return match;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final section = _currentSection();
+    final search = _searchCtrl.text.trim().toLowerCase();
+    final lines = search.isEmpty
+        ? section.lines
+        : section.lines
+            .where((line) =>
+                line.name.toLowerCase().contains(search) ||
+                (line.sku?.toLowerCase().contains(search) ?? false))
+            .toList();
+    final processing = widget.parent._processing;
+    final canMove = widget.parent._hasMoveDestinations(section.id);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(section.label),
+        actions: [
+          if (section.renamable || section.deletable)
+            IconButton(
+              tooltip: 'Gérer la section',
+              icon: const Icon(Icons.more_horiz),
+              onPressed: processing
+                  ? null
+                  : () async {
+                      await widget.parent._showSectionActions(
+                        section,
+                        onChanged: () => setState(() {}),
+                      );
+                    },
+            ),
+          if (widget.parent.widget.onShowJournal != null)
+            IconButton(
+              tooltip: 'Journal',
+              icon: const Icon(Icons.history),
+              onPressed: () =>
+                  widget.parent._openSectionJournal(section.id),
+            ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: processing
+            ? null
+            : () async {
+                await widget.parent._handleAddPieces(section.id);
+                if (mounted) setState(() {});
+              },
+        tooltip: 'Ajouter une pièce',
+        child: const Icon(Icons.add),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '${section.totalQty} pièce(s)',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _searchCtrl,
+              decoration: InputDecoration(
+                hintText: 'Rechercher une pièce',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchCtrl.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () => _searchCtrl.clear(),
+                      ),
+                border: const OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: lines.isEmpty
+                  ? const Center(
+                      child: Text('Aucune pièce trouvée pour cette section.'),
+                    )
+                  : ListView.separated(
+                      itemCount: lines.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final line = lines[index];
+                        return _InventoryLineRow(
+                          line: line,
+                          busy: processing,
+                          onIncrement: () async {
+                            await widget.parent._handleQuickAdjust(
+                              section.id,
+                              line,
+                              increase: true,
+                            );
+                            if (mounted) setState(() {});
+                          },
+                          onDecrement: () async {
+                            await widget.parent._handleQuickAdjust(
+                              section.id,
+                              line,
+                              increase: false,
+                            );
+                            if (mounted) setState(() {});
+                          },
+                          onDelete: () async {
+                            await widget.parent._handleDeleteItem(
+                              line,
+                              sectionId: section.id,
+                            );
+                            if (mounted) setState(() {});
+                          },
+                          onMove: canMove
+                              ? () async {
+                                  await widget.parent._handleMoveStock(
+                                    section.id,
+                                    line,
+                                  );
+                                  if (mounted) setState(() {});
+                                }
+                              : null,
+                        );
+                      },
+                    ),
+            ),
+            if (section.deletable)
+              TextButton.icon(
+                onPressed: processing
+                    ? null
+                    : () async {
+                        await widget.parent._handleDeleteSection(section.id!);
+                        if (mounted) Navigator.of(context).pop();
+                      },
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Supprimer cette section'),
+                style: TextButton.styleFrom(foregroundColor: Colors.red),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 
 class _InventoryLineRow extends StatelessWidget {
   const _InventoryLineRow({
@@ -2008,6 +2232,21 @@ class _SectionSnapshot {
 
   int get totalQty => lines.fold<int>(
       0, (previousValue, element) => previousValue + element.qty);
+
+  _SectionSnapshot copyWith({
+    String? label,
+    List<_InventoryBreakdownLine>? lines,
+    bool? deletable,
+    bool? renamable,
+  }) {
+    return _SectionSnapshot(
+      id: id,
+      label: label ?? this.label,
+      lines: lines ?? this.lines,
+      deletable: deletable ?? this.deletable,
+      renamable: renamable ?? this.renamable,
+    );
+  }
 }
 
 class _AddStockRequest {
