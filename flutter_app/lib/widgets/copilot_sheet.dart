@@ -113,13 +113,15 @@ class _CopilotSheetState extends State<CopilotSheet> {
       );
     } finally {
       if (mounted) {
-        setState(() => _submitting = false);
+        setState(() {
+          _submitting = false;
+        });
       }
     }
     if (feedback != null && mounted) {
       final CopilotFeedback result = feedback;
       setState(() {
-        _messages.insert(
+        _addMessage(
           0,
           CopilotTranscript(
             text: result.message,
@@ -129,6 +131,13 @@ class _CopilotSheetState extends State<CopilotSheet> {
           ),
         );
       });
+    }
+  }
+
+  void _addMessage(int index, CopilotTranscript message) {
+    _messages.insert(index, message);
+    if (_messages.length > 20) {
+      _messages.removeLast();
     }
   }
 

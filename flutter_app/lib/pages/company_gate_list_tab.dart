@@ -12,6 +12,7 @@ class _ListTab extends StatelessWidget {
     required this.onIncreaseQty,
     required this.onDecreaseQty,
     required this.onDeleteRequest,
+    required this.onShowDetails,
     required this.onMarkPurchased,
     required this.updatingRequestIds,
   });
@@ -21,6 +22,7 @@ class _ListTab extends StatelessWidget {
   final VoidCallback onReviewInventory;
   final void Function(Map<String, dynamic> request) onIncreaseQty;
   final void Function(Map<String, dynamic> request) onDecreaseQty;
+  final void Function(Map<String, dynamic> request) onShowDetails;
   final void Function(Map<String, dynamic> request) onDeleteRequest;
   final void Function(Map<String, dynamic> request) onMarkPurchased;
   final Set<String> updatingRequestIds;
@@ -76,6 +78,7 @@ class _ListTab extends StatelessWidget {
                   data: request,
                   onIncrementQty: () => onIncreaseQty(request),
                   onDecrementQty: () => onDecreaseQty(request),
+                  onShowDetails: () => onShowDetails(request),
                   onDelete: () => onDeleteRequest(request),
                   onMarkPurchased: () => onMarkPurchased(request),
                   updating: requestId != null &&
@@ -94,6 +97,7 @@ class _PurchaseCard extends StatelessWidget {
     required this.data,
     required this.onIncrementQty,
     required this.onDecrementQty,
+    required this.onShowDetails,
     required this.onDelete,
     required this.onMarkPurchased,
     required this.updating,
@@ -102,6 +106,7 @@ class _PurchaseCard extends StatelessWidget {
   final Map<String, dynamic> data;
   final VoidCallback onIncrementQty;
   final VoidCallback onDecrementQty;
+  final VoidCallback onShowDetails;
   final VoidCallback onDelete;
   final VoidCallback onMarkPurchased;
   final bool updating;
@@ -116,6 +121,7 @@ class _PurchaseCard extends StatelessWidget {
     final section = data['section'] as Map<String, dynamic>?;
     final sectionName = section?['name']?.toString();
     final fallbackSectionId = data['section_id']?.toString();
+    final noteText = data['note']?.toString().trim();
     final statusLabel = _statusLabel(status);
     final badgeColor = _statusColor(status);
     final isPending = status == 'pending';
@@ -131,13 +137,17 @@ class _PurchaseCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(name,
+                Expanded(
+                  child: Text(
+                    name,
                     style: Theme.of(context)
                         .textTheme
                         .titleMedium
-                        ?.copyWith(fontWeight: FontWeight.w700)),
-                const Spacer(),
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                ),
                 _Badge(
                   label: statusLabel,
                   color: badgeColor,
@@ -186,11 +196,27 @@ class _PurchaseCard extends StatelessWidget {
               Text(
                 'Section : ${sectionName ?? fallbackSectionId}',
               ),
+            if (noteText != null && noteText.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  noteText,
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(color: Colors.black54),
+                ),
+              ),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
+                OutlinedButton.icon(
+                  onPressed: onShowDetails,
+                  icon: const Icon(Icons.info_outline),
+                  label: const Text('Détails'),
+                ),
                 if (isPending)
                   FilledButton.icon(
                     onPressed: onMarkPurchased,

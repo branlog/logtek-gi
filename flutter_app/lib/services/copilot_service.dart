@@ -108,7 +108,9 @@ class CopilotService {
     await _speech.listen(
       localeId: localeId,
       onResult: _onSpeechResult,
-      listenMode: stt.ListenMode.dictation,
+      listenOptions: stt.SpeechListenOptions(
+        listenMode: stt.ListenMode.dictation,
+      ),
     );
     return true;
   }
@@ -134,8 +136,7 @@ class CopilotService {
         payload: <String, dynamic>{},
       );
     }
-    if (!OpenAIConfig.isConfigured ||
-        !ConnectivityService.instance.isOnline) {
+    if (!OpenAIConfig.isConfigured || !ConnectivityService.instance.isOnline) {
       return _localIntent(trimmed);
     }
     try {
@@ -170,11 +171,10 @@ class CopilotService {
           'messages': [
             {
               'role': 'system',
-              'content':
-                  'Tu es LogAI, un assistant pour une entreprise de gestion d’inventaire. '
-                      'Réponds en français de façon concise mais utile. '
-                      'Si l’utilisateur pose une question générale ou demande un conseil, réponds directement. '
-                      'Si la demande nécessite une action précise (inventaire, tâches, carburant), essaie de proposer des étapes.'
+              'content': 'Tu es LogAI, un assistant pour une entreprise de gestion d’inventaire. '
+                  'Réponds en français de façon concise mais utile. '
+                  'Si l’utilisateur pose une question générale ou demande un conseil, réponds directement. '
+                  'Si la demande nécessite une action précise (inventaire, tâches, carburant), essaie de proposer des étapes.'
             },
             {
               'role': 'user',
@@ -256,15 +256,14 @@ class CopilotService {
         'messages': [
           {
             'role': 'system',
-            'content':
-                'Tu es LogAI, l’assistant pour une application d’inventaire. '
-                    'Analyse la commande utilisateur et retourne un JSON respectant le schema. '
-                    'Les intents possibles : purchase_request, inventory_adjust, equipment_task, diesel_log, unknown. '
-                    'Interprète les quantités (chiffres, unités comme L, litres, gallons) et fournis un résumé court en français. '
-                    'Le payload doit contenir tous les champs utiles : item_name, qty (positif pour ajout, négatif pour retrait), '
-                    'warehouse, section, note, priority, delay_days, repeat_days, equipment_name, equipment_id, liters pour diesel, etc. '
-                    'Si l’utilisateur indique avoir déjà acheté/reçu une pièce existante, mets payload.action="mark_purchased" pour fermer la demande concernée. '
-                    'Si tu n’es pas certain, renvoie intent=unknown mais inclue la meilleure estimation dans payload.raw_text.'
+            'content': 'Tu es LogAI, l’assistant pour une application d’inventaire. '
+                'Analyse la commande utilisateur et retourne un JSON respectant le schema. '
+                'Les intents possibles : purchase_request, inventory_adjust, equipment_task, diesel_log, unknown. '
+                'Interprète les quantités (chiffres, unités comme L, litres, gallons) et fournis un résumé court en français. '
+                'Le payload doit contenir tous les champs utiles : item_name, qty (positif pour ajout, négatif pour retrait), '
+                'warehouse, section, note, priority, delay_days, repeat_days, equipment_name, equipment_id, liters pour diesel, etc. '
+                'Si l’utilisateur indique avoir déjà acheté/reçu une pièce existante, mets payload.action="mark_purchased" pour fermer la demande concernée. '
+                'Si tu n’es pas certain, renvoie intent=unknown mais inclue la meilleure estimation dans payload.raw_text.'
           },
           {
             'role': 'user',
@@ -322,8 +321,7 @@ class CopilotService {
     if (text == null) return null;
     final parsed = jsonDecode(text);
     if (parsed is! Map) return null;
-    return _intentFromJson(parsed.cast<String, dynamic>(),
-        rawText: raw);
+    return _intentFromJson(parsed.cast<String, dynamic>(), rawText: raw);
   }
 
   CopilotIntent _localIntent(String raw) {
@@ -426,8 +424,7 @@ class CopilotService {
 
   void _onSpeechError(SpeechRecognitionError error) {
     final rawMessage = error.errorMsg;
-    final message =
-        rawMessage.isNotEmpty ? rawMessage : 'Erreur microphone';
+    final message = rawMessage.isNotEmpty ? rawMessage : 'Erreur microphone';
     _transcripts.add(
       CopilotTranscript(
         text: message,

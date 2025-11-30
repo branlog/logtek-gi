@@ -11,21 +11,25 @@ class OfflineActionTypes {
   static const purchaseRequestCreate = 'purchase_request_create';
   static const purchaseRequestUpdate = 'purchase_request_update';
   static const purchaseRequestDelete = 'purchase_request_delete';
-  static const purchaseRequestMarkToPlace =
-      'purchase_request_mark_to_place';
+  static const purchaseRequestMarkToPlace = 'purchase_request_mark_to_place';
   static const inventoryStockDelta = 'inventory_stock_delta';
   static const inventoryDeleteItem = 'inventory_delete_item';
   static const inventorySectionCreate = 'inventory_section_create';
   static const inventorySectionUpdate = 'inventory_section_update';
   static const inventorySectionDelete = 'inventory_section_delete';
+  static const inventoryItemCreate = 'inventory_item_create';
+  static const inventoryItemMetaUpdate = 'inventory_item_meta_update';
   static const equipmentMetaUpdate = 'equipment_meta_update';
+  static const equipmentDelete = 'equipment_delete';
+  static const joinCodeDelete = 'join_code_delete';
+  static const warehouseCreate = 'warehouse_create';
+  static const equipmentCreate = 'equipment_create';
 }
 
 class OfflineActionsService {
   OfflineActionsService._();
 
-  static final OfflineActionsService instance =
-      OfflineActionsService._();
+  static final OfflineActionsService instance = OfflineActionsService._();
 
   final Map<String, OfflineActionHandler> _handlers =
       <String, OfflineActionHandler>{};
@@ -94,8 +98,7 @@ class OfflineActionsService {
   }
 
   Future<void> _notifyQueueLength() async {
-    final count =
-        (await OfflineStorage.instance.pendingActions()).length;
+    final count = (await OfflineStorage.instance.pendingActions()).length;
     if (!_queueController.isClosed) {
       _queueController.add(count);
     }

@@ -1,7 +1,7 @@
 name: logtek_gi
 description: Logtek G&I (Gestion & Inventaire) — Flutter starter
 publish_to: "none"
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -26,6 +26,9 @@ dependencies:
   path: ^1.9.0
   flutter_dotenv: ^5.1.0
   speech_to_text: ^6.3.0
+  image_picker: ^1.0.7
+  # Notifications locales (sans Firebase)
+  flutter_local_notifications: ^18.0.1
 
 dev_dependencies:
   flutter_test:

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/company_join_code.dart';
@@ -223,6 +225,15 @@ class CompanyRepository {
         error: error,
       );
     } catch (error) {
+      if (_isNetworkError(error)) {
+        final cached = await _readCachedMapList(OfflineCacheKeys.warehouses);
+        if (cached != null) {
+          return RepositoryResult<List<Map<String, dynamic>>>(data: cached);
+        }
+        return const RepositoryResult<List<Map<String, dynamic>>>(
+          data: <Map<String, dynamic>>[],
+        );
+      }
       final cached = await _readCachedMapList(OfflineCacheKeys.warehouses);
       if (cached != null) {
         return RepositoryResult<List<Map<String, dynamic>>>(
@@ -297,6 +308,15 @@ class CompanyRepository {
         error: error,
       );
     } catch (error) {
+      if (_isNetworkError(error)) {
+        final cached = await _readCachedInventoryEntries();
+        if (cached != null) {
+          return RepositoryResult<List<InventoryEntry>>(data: cached);
+        }
+        return const RepositoryResult<List<InventoryEntry>>(
+          data: <InventoryEntry>[],
+        );
+      }
       final cached = await _readCachedInventoryEntries();
       if (cached != null) {
         return RepositoryResult<List<InventoryEntry>>(
@@ -381,6 +401,16 @@ class CompanyRepository {
         data: entries,
         error: error,
       );
+    } catch (error) {
+      if (_isNetworkError(error)) {
+        return RepositoryResult<List<InventoryEntry>>(
+          data: entries,
+        );
+      }
+      return RepositoryResult<List<InventoryEntry>>(
+        data: entries,
+        error: error,
+      );
     }
 
     final result = RepositoryResult<List<InventoryEntry>>(data: entries);
@@ -402,9 +432,13 @@ class CompanyRepository {
           )
           .eq('company_id', companyId)
           .order('created_at', ascending: false);
-      final rows = (response as List)
-          .cast<Map<String, dynamic>>()
-          .map(MembershipInvite.fromMap)
+      final rawRows = (response as List).cast<Map<String, dynamic>>();
+      await _saveCacheForCurrentUser(
+        OfflineCacheKeys.membershipInvites,
+        rawRows,
+      );
+      final rows = rawRows
+          .map((raw) => MembershipInvite.fromMap(raw))
           .toList(growable: false);
       return RepositoryResult<List<MembershipInvite>>(data: rows);
     } on PostgrestException catch (error) {
@@ -414,6 +448,33 @@ class CompanyRepository {
         return RepositoryResult<List<MembershipInvite>>(
           data: const <MembershipInvite>[],
           missingTables: <String>[missing],
+        );
+      }
+      final cached =
+          await _readCachedMapList(OfflineCacheKeys.membershipInvites);
+      if (cached != null) {
+        final rows = cached
+            .map((raw) => MembershipInvite.fromMap(raw))
+            .toList(growable: false);
+        return RepositoryResult<List<MembershipInvite>>(
+          data: rows,
+          error: error,
+        );
+      }
+      return RepositoryResult<List<MembershipInvite>>(
+        data: const <MembershipInvite>[],
+        error: error,
+      );
+    } catch (error) {
+      final cached =
+          await _readCachedMapList(OfflineCacheKeys.membershipInvites);
+      if (cached != null) {
+        final rows = cached
+            .map((raw) => MembershipInvite.fromMap(raw))
+            .toList(growable: false);
+        return RepositoryResult<List<MembershipInvite>>(
+          data: rows,
+          error: error,
         );
       }
       return RepositoryResult<List<MembershipInvite>>(
@@ -434,9 +495,10 @@ class CompanyRepository {
           )
           .eq('company_id', companyId)
           .order('created_at', ascending: false);
-      final rows = (response as List)
-          .cast<Map<String, dynamic>>()
-          .map(CompanyJoinCode.fromMap)
+      final rawRows = (response as List).cast<Map<String, dynamic>>();
+      await _saveCacheForCurrentUser(OfflineCacheKeys.joinCodes, rawRows);
+      final rows = rawRows
+          .map((raw) => CompanyJoinCode.fromMap(raw))
           .toList(growable: false);
       return RepositoryResult<List<CompanyJoinCode>>(data: rows);
     } on PostgrestException catch (error) {
@@ -446,6 +508,31 @@ class CompanyRepository {
         return RepositoryResult<List<CompanyJoinCode>>(
           data: const <CompanyJoinCode>[],
           missingTables: <String>[missing],
+        );
+      }
+      final cached = await _readCachedMapList(OfflineCacheKeys.joinCodes);
+      if (cached != null) {
+        final rows = cached
+            .map((raw) => CompanyJoinCode.fromMap(raw))
+            .toList(growable: false);
+        return RepositoryResult<List<CompanyJoinCode>>(
+          data: rows,
+          error: error,
+        );
+      }
+      return RepositoryResult<List<CompanyJoinCode>>(
+        data: const <CompanyJoinCode>[],
+        error: error,
+      );
+    } catch (error) {
+      final cached = await _readCachedMapList(OfflineCacheKeys.joinCodes);
+      if (cached != null) {
+        final rows = cached
+            .map((raw) => CompanyJoinCode.fromMap(raw))
+            .toList(growable: false);
+        return RepositoryResult<List<CompanyJoinCode>>(
+          data: rows,
+          error: error,
         );
       }
       return RepositoryResult<List<CompanyJoinCode>>(
@@ -458,8 +545,7 @@ class CompanyRepository {
   Future<RepositoryResult<List<Map<String, dynamic>>>> fetchEquipment() async {
     final membershipResult = await _fetchMembership();
     if (membershipResult.hasMissingTables || membershipResult.hasError) {
-      final cached =
-          await _readCachedMapList(OfflineCacheKeys.equipment);
+      final cached = await _readCachedMapList(OfflineCacheKeys.equipment);
       if (cached != null) {
         return RepositoryResult<List<Map<String, dynamic>>>(
           data: cached,
@@ -476,8 +562,7 @@ class CompanyRepository {
 
     final membership = membershipResult.data;
     if (membership?.companyId == null) {
-      final cached =
-          await _readCachedMapList(OfflineCacheKeys.equipment);
+      final cached = await _readCachedMapList(OfflineCacheKeys.equipment);
       if (cached != null) {
         return RepositoryResult<List<Map<String, dynamic>>>(
           data: cached,
@@ -511,8 +596,7 @@ class CompanyRepository {
           missingTables: <String>[missing],
         );
       }
-      final cached =
-          await _readCachedMapList(OfflineCacheKeys.equipment);
+      final cached = await _readCachedMapList(OfflineCacheKeys.equipment);
       if (cached != null) {
         return RepositoryResult<List<Map<String, dynamic>>>(
           data: cached,
@@ -524,8 +608,18 @@ class CompanyRepository {
         error: error,
       );
     } catch (error) {
-      final cached =
-          await _readCachedMapList(OfflineCacheKeys.equipment);
+      if (_isNetworkError(error)) {
+        final cached = await _readCachedMapList(OfflineCacheKeys.equipment);
+        if (cached != null) {
+          return RepositoryResult<List<Map<String, dynamic>>>(
+            data: cached,
+          );
+        }
+        return const RepositoryResult<List<Map<String, dynamic>>>(
+          data: <Map<String, dynamic>>[],
+        );
+      }
+      final cached = await _readCachedMapList(OfflineCacheKeys.equipment);
       if (cached != null) {
         return RepositoryResult<List<Map<String, dynamic>>>(
           data: cached,
@@ -554,15 +648,36 @@ class CompanyRepository {
       if (response == null) {
         return const RepositoryResult<Map<String, dynamic>?>(data: null);
       }
-      return RepositoryResult<Map<String, dynamic>?>(
-        data: Map<String, dynamic>.from(response as Map),
-      );
+      final profile = Map<String, dynamic>.from(response as Map);
+      await _saveCacheForCurrentUser(OfflineCacheKeys.userProfile, profile);
+      return RepositoryResult<Map<String, dynamic>?>(data: profile);
     } on PostgrestException catch (error) {
       if (_isMissingTable(error)) {
         final missing = _extractMissingTable(error.message) ?? 'user_profiles';
         return RepositoryResult<Map<String, dynamic>?>(
           data: null,
           missingTables: <String>[missing],
+        );
+      }
+      final cached =
+          await _readCacheForCurrentUser(OfflineCacheKeys.userProfile);
+      if (cached is Map) {
+        return RepositoryResult<Map<String, dynamic>?>(
+          data: Map<String, dynamic>.from(cached),
+          error: error,
+        );
+      }
+      return RepositoryResult<Map<String, dynamic>?>(
+        data: null,
+        error: error,
+      );
+    } catch (error) {
+      final cached =
+          await _readCacheForCurrentUser(OfflineCacheKeys.userProfile);
+      if (cached is Map) {
+        return RepositoryResult<Map<String, dynamic>?>(
+          data: Map<String, dynamic>.from(cached),
+          error: error,
         );
       }
       return RepositoryResult<Map<String, dynamic>?>(
@@ -573,9 +688,10 @@ class CompanyRepository {
   }
 
   Future<RepositoryResult<List<Map<String, dynamic>>>> fetchJournalEntries({
-    required String scope,
+    String? scope,
     String? entityId,
     int limit = 50,
+    bool prefix = false,
   }) async {
     final membershipResult = await _fetchMembership();
     if (membershipResult.hasMissingTables || membershipResult.hasError) {
@@ -600,10 +716,16 @@ class CompanyRepository {
           .select(
             'id, scope, entity_id, event, note, payload, created_at, created_by',
           )
-          .eq('company_id', companyId)
-          .eq('scope', scope);
+          .eq('company_id', companyId);
+      if (scope != null) {
+        query = query.eq('scope', scope);
+      }
       if (entityId != null && entityId.isNotEmpty) {
-        query = query.eq('entity_id', entityId);
+        if (prefix) {
+          query = query.like('entity_id', '$entityId%');
+        } else {
+          query = query.eq('entity_id', entityId);
+        }
       }
       final response =
           await query.order('created_at', ascending: false).limit(limit);
@@ -685,6 +807,18 @@ class CompanyRepository {
         error: error,
       );
     } catch (error) {
+      if (_isNetworkError(error)) {
+        final cached =
+            await _readCachedMapList(OfflineCacheKeys.purchaseRequests);
+        if (cached != null) {
+          return RepositoryResult<List<Map<String, dynamic>>>(
+            data: cached,
+          );
+        }
+        return const RepositoryResult<List<Map<String, dynamic>>>(
+          data: <Map<String, dynamic>>[],
+        );
+      }
       final cached =
           await _readCachedMapList(OfflineCacheKeys.purchaseRequests);
       if (cached != null) {
@@ -789,6 +923,17 @@ class CompanyRepository {
     return message.contains('does not exist') && message.contains('relation');
   }
 
+  bool _isNetworkError(Object error) {
+    if (error is SocketException || error is HandshakeException) return true;
+    final message = error.toString().toLowerCase();
+    return message.contains('host lookup') ||
+        message.contains('failed host lookup') ||
+        message.contains('socketexception') ||
+        message.contains('connection refused') ||
+        message.contains('network is unreachable') ||
+        message.contains('dns');
+  }
+
   String? _extractMissingTable(String message) {
     final match = RegExp(r'relation "?([a-zA-Z0-9_\.]+)"? does not exist')
         .firstMatch(message);
@@ -841,6 +986,43 @@ class CompanyRepository {
     final membership = _membershipFromJson(_coerceMap(map['membership']));
     final members = _decodeMapList(map['members']);
     return CompanyOverview(membership: membership, members: members);
+  }
+
+  Future<CompanyOverview?> readCachedCompanyOverview() {
+    return _readCachedCompanyOverview();
+  }
+
+  Future<List<Map<String, dynamic>>?> readCachedWarehouses() {
+    return _readCachedMapList(OfflineCacheKeys.warehouses);
+  }
+
+  Future<List<InventoryEntry>?> readCachedInventoryEntries() {
+    return _readCachedInventoryEntries();
+  }
+
+  Future<List<Map<String, dynamic>>?> readCachedEquipment() {
+    return _readCachedMapList(OfflineCacheKeys.equipment);
+  }
+
+  Future<List<Map<String, dynamic>>?> readCachedPurchaseRequests() {
+    return _readCachedMapList(OfflineCacheKeys.purchaseRequests);
+  }
+
+  Future<List<CompanyJoinCode>?> readCachedJoinCodes() async {
+    final rows = await _readCachedMapList(OfflineCacheKeys.joinCodes);
+    return rows?.map(CompanyJoinCode.fromMap).toList(growable: false);
+  }
+
+  Future<List<MembershipInvite>?> readCachedInvites() async {
+    final rows = await _readCachedMapList(OfflineCacheKeys.membershipInvites);
+    return rows?.map(MembershipInvite.fromMap).toList(growable: false);
+  }
+
+  Future<Map<String, dynamic>?> readCachedUserProfile() async {
+    final raw = await _readCacheForCurrentUser(OfflineCacheKeys.userProfile);
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return null;
   }
 
   Map<String, dynamic> _membershipToJson(CompanyMembership membership) {

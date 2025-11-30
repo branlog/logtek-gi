@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path/path.dart' as p;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/company_join_code.dart';
@@ -15,13 +18,17 @@ import '../services/company_commands.dart';
 import '../services/company_repository.dart';
 import '../services/connectivity_service.dart';
 import '../services/copilot_service.dart';
+import '../services/maintenance_service.dart';
 import '../services/offline_actions_service.dart';
 import '../services/offline_storage.dart';
+import '../services/notification_service.dart';
 import '../services/supabase_service.dart';
 import '../theme/app_colors.dart';
 import '../widgets/sync_status_chip.dart';
 import '../widgets/copilot_sheet.dart';
 import '../utils/async_utils.dart';
+import 'sign_in_page.dart';
+import 'notification_settings_page.dart';
 
 part 'company_gate_home_tab.dart';
 part 'company_gate_list_tab.dart';
@@ -42,7 +49,18 @@ typedef _SectionSelectionResult = ({bool cancelled, String? sectionId});
 
 typedef _AsyncCallback = Future<void> Function();
 typedef _AsyncValueChanged<T> = Future<void> Function(T value);
+typedef _MetaUpdateOutcome = ({
+  bool ok,
+  String message,
+  bool isError,
+  bool queuedOffline,
+});
+
 enum _InviteOption { email, joinCode }
+
+const String _equipmentAssignedToKey = 'assigned_to';
+const String _equipmentAssignedNameKey = 'assigned_to_name';
+const String _equipmentAssignedAtKey = 'assigned_at';
 
 class _CompanyGatePageState extends State<CompanyGatePage> {
   late final CompanyRepository _repository;
@@ -66,11 +84,14 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   List<Map<String, dynamic>> _purchaseRequests = const <Map<String, dynamic>>[];
   List<CompanyJoinCode> _joinCodes = const <CompanyJoinCode>[];
   List<MembershipInvite> _invites = const <MembershipInvite>[];
+  List<InventoryEntry> _lowStockItems = const <InventoryEntry>[];
   Map<String, dynamic>? _userProfile;
   List<String> _missingTables = const <String>[];
   Set<String> _updatingPurchaseRequests = const <String>{};
   final Map<String, String> _journalUserCache = <String, String>{};
+  final Set<String> _pendingJoinCodeDeletes = <String>{};
   final Random _random = Random();
+  final Map<String, String> _offlineIdMapping = <String, String>{};
   bool _offlineHandlersRegistered = false;
   final List<_CopilotIncident> _copilotIncidents = <_CopilotIncident>[];
   static const Map<String, String> _accentMap = {
@@ -103,6 +124,9 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   };
   _InlineMessage? _inlineMessage;
   Timer? _inlineMessageTimer;
+  bool _offlineBannerVisible = false;
+  Timer? _offlineBannerTimer;
+  bool _isDeletingAccount = false;
 
   final TextEditingController _companyNameCtrl = TextEditingController();
   final TextEditingController _joinCodeCtrl = TextEditingController();
@@ -114,23 +138,34 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     super.initState();
     _repository = CompanyRepository(Supa.i);
     _commands = CompanyCommands(Supa.i);
+    _offlineIdMapping.addAll(
+      OfflineStorage.instance.snapshotIdMappings(),
+    );
     _registerOfflineHandlers();
     _isOnline = ConnectivityService.instance.isOnline;
     _connectivitySub =
-        ConnectivityService.instance.onStatusChange.listen((online) {
+        ConnectivityService.instance.onStatusChange.listen((online) async {
       if (!mounted) return;
-      setState(() => _isOnline = online);
+      setState(() {
+        _isOnline = online;
+        if (online) {
+          _offlineBannerVisible = false;
+        }
+      });
       if (online) {
-        OfflineActionsService.instance.processQueue();
-        _refreshAll();
+        _offlineBannerTimer?.cancel();
+        await OfflineActionsService.instance.processQueue();
+        await _refreshPendingActionsCount();
+        await NotificationService.instance.reconnect();
+        await _refreshAll();
       } else {
+        _showOfflineBannerTemporarily();
         _refreshPendingActionsCount();
       }
     });
     _refreshAll();
     _refreshPendingActionsCount();
-    _queueSub =
-        OfflineActionsService.instance.onQueueChanged.listen((count) {
+    _queueSub = OfflineActionsService.instance.onQueueChanged.listen((count) {
       if (!mounted) return;
       setState(() => _pendingActionCount = count);
     });
@@ -141,6 +176,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     _connectivitySub?.cancel();
     _queueSub?.cancel();
     _inlineMessageTimer?.cancel();
+    _offlineBannerTimer?.cancel();
     _companyNameCtrl.dispose();
     _joinCodeCtrl.dispose();
     _unregisterOfflineHandlers();
@@ -155,92 +191,270 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       _transientError = null;
     });
 
-    try {
-      final overviewResult = await _repository.fetchCompanyOverview();
-      final membership = overviewResult.data.membership;
-      final missing = <String>{...overviewResult.missingTables};
-      String? errorText = _describeError(overviewResult.error);
-
-      List<Map<String, dynamic>> warehouses = const <Map<String, dynamic>>[];
-      List<InventoryEntry> inventory = const <InventoryEntry>[];
-      List<Map<String, dynamic>> equipment = const <Map<String, dynamic>>[];
-      List<Map<String, dynamic>> purchaseRequests =
-          const <Map<String, dynamic>>[];
-      List<CompanyJoinCode> joinCodes = const <CompanyJoinCode>[];
-      List<MembershipInvite> invites = const <MembershipInvite>[];
-      Map<String, dynamic>? profile;
-
-      if (membership?.companyId != null) {
-        final companyId = membership!.companyId!;
-
-        final warehousesResult = await _repository.fetchWarehouses();
-        warehouses = warehousesResult.data;
-        missing.addAll(warehousesResult.missingTables);
-        errorText ??= _describeError(warehousesResult.error);
-
-        final inventoryResult = await _repository.fetchInventory();
-        inventory = inventoryResult.data;
-        missing.addAll(inventoryResult.missingTables);
-        errorText ??= _describeError(inventoryResult.error);
-
-        final equipmentResult = await _repository.fetchEquipment();
-        equipment = equipmentResult.data;
-        missing.addAll(equipmentResult.missingTables);
-        errorText ??= _describeError(equipmentResult.error);
-
-        final requestsResult = await _repository.fetchPurchaseRequests();
-        purchaseRequests = requestsResult.data;
-        missing.addAll(requestsResult.missingTables);
-        errorText ??= _describeError(requestsResult.error);
-
-        final joinCodeResult =
-            await _repository.fetchJoinCodes(companyId: companyId);
-        joinCodes = joinCodeResult.data;
-        missing.addAll(joinCodeResult.missingTables);
-        errorText ??= _describeError(joinCodeResult.error);
-
-        final inviteResult = await _repository.fetchMembershipInvites(
-          companyId: companyId,
-        );
-        invites = inviteResult.data;
-        missing.addAll(inviteResult.missingTables);
-        errorText ??= _describeError(inviteResult.error);
-
-        final profileResult = await _repository.fetchUserProfile();
-        profile = profileResult.data;
-        missing.addAll(profileResult.missingTables);
-        errorText ??= _describeError(profileResult.error);
+    if (!_isOnline) {
+      final loaded = await _loadOfflineSnapshot(triggerBanner: true);
+      if (loaded) {
+        if (mounted) {
+          setState(() => _isRefreshing = false);
+        }
+        _refreshPendingActionsCount();
+        return;
       }
+    }
 
-      if (!mounted) return;
-      setState(() {
-        _overview = overviewResult.data;
-        _warehouses = warehouses;
-        _inventory = inventory;
-        _equipment = equipment;
-        _purchaseRequests = purchaseRequests;
-        _joinCodes = joinCodes;
-        _invites = invites;
-        _userProfile = profile;
-        _missingTables = missing.toList();
-        _transientError = errorText;
-        _isLoading = false;
-      });
-      runDetached(_persistPurchaseRequestsCache());
-      runDetached(_persistEquipmentCache());
-      runDetached(_persistPurchaseRequestsCache());
+    try {
+      await (() async {
+        final overviewResult = await _repository
+            .fetchCompanyOverview()
+            .timeout(const Duration(seconds: 8));
+        final membership = overviewResult.data.membership;
+        final missing = <String>{...overviewResult.missingTables};
+        String? errorText = _describeError(overviewResult.error);
+
+        List<Map<String, dynamic>> warehouses = const <Map<String, dynamic>>[];
+        List<InventoryEntry> inventory = const <InventoryEntry>[];
+        List<Map<String, dynamic>> equipment = const <Map<String, dynamic>>[];
+        List<Map<String, dynamic>> purchaseRequests =
+            const <Map<String, dynamic>>[];
+        List<CompanyJoinCode> joinCodes = const <CompanyJoinCode>[];
+        List<MembershipInvite> invites = const <MembershipInvite>[];
+        Map<String, dynamic>? profile;
+
+        if (membership?.companyId != null) {
+          final companyId = membership!.companyId!;
+
+          final warehousesResult = await _repository
+              .fetchWarehouses()
+              .timeout(const Duration(seconds: 8));
+          warehouses = warehousesResult.data;
+          missing.addAll(warehousesResult.missingTables);
+          errorText ??= _describeError(warehousesResult.error);
+
+          final inventoryResult = await _repository
+              .fetchInventory()
+              .timeout(const Duration(seconds: 8));
+          inventory = inventoryResult.data;
+          missing.addAll(inventoryResult.missingTables);
+          errorText ??= _describeError(inventoryResult.error);
+
+          final equipmentResult = await _repository
+              .fetchEquipment()
+              .timeout(const Duration(seconds: 8));
+          equipment = equipmentResult.data;
+          missing.addAll(equipmentResult.missingTables);
+          errorText ??= _describeError(equipmentResult.error);
+
+          final requestsResult = await _repository
+              .fetchPurchaseRequests()
+              .timeout(const Duration(seconds: 8));
+          purchaseRequests = requestsResult.data;
+          missing.addAll(requestsResult.missingTables);
+          errorText ??= _describeError(requestsResult.error);
+
+          final joinCodeResult = await _repository
+              .fetchJoinCodes(companyId: companyId)
+              .timeout(const Duration(seconds: 8));
+          joinCodes = joinCodeResult.data;
+          if (_pendingJoinCodeDeletes.isNotEmpty) {
+            joinCodes = joinCodes
+                .where((code) => !_pendingJoinCodeDeletes.contains(code.id))
+                .toList();
+          }
+          missing.addAll(joinCodeResult.missingTables);
+          errorText ??= _describeError(joinCodeResult.error);
+
+          final inviteResult = await _repository
+              .fetchMembershipInvites(companyId: companyId)
+              .timeout(const Duration(seconds: 8));
+          invites = inviteResult.data;
+          missing.addAll(inviteResult.missingTables);
+          errorText ??= _describeError(inviteResult.error);
+
+          final profileResult = await _repository
+              .fetchUserProfile()
+              .timeout(const Duration(seconds: 8));
+          profile = profileResult.data;
+          missing.addAll(profileResult.missingTables);
+          errorText ??= _describeError(profileResult.error);
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _overview = overviewResult.data;
+          _warehouses = warehouses;
+          _inventory = inventory;
+          _equipment = equipment;
+          _purchaseRequests = purchaseRequests;
+          _joinCodes = joinCodes;
+          _invites = invites;
+          _userProfile = profile;
+          _missingTables = missing.toList();
+          _transientError = errorText;
+          _recalculateLowStockItems(inventory);
+          _isLoading = false;
+        });
+        runDetached(_persistPurchaseRequestsCache());
+        runDetached(_persistEquipmentCache());
+        runDetached(_persistPurchaseRequestsCache());
+      })();
     } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _fatalError = 'Impossible de charger les données : $error';
-        _isLoading = false;
-      });
+      if (error is TimeoutException) {
+        final loaded = await _loadOfflineSnapshot(triggerBanner: true);
+        if (mounted) {
+          setState(() {
+            _isOnline = false;
+            _offlineBannerVisible = true;
+          });
+        }
+        if (!loaded && mounted) {
+          setState(() {
+            _fatalError = 'Données hors ligne indisponibles.';
+            _isLoading = false;
+          });
+        }
+        if (mounted) {
+          setState(() => _isRefreshing = false);
+        }
+        return;
+      }
+      final loaded = await _loadOfflineSnapshot(triggerBanner: _isNetworkError(error));
+      if (!loaded) {
+        if (!mounted) return;
+        setState(() {
+          if (_isNetworkError(error)) {
+            _isOnline = false;
+            _offlineBannerVisible = true;
+          }
+          _fatalError = _isNetworkError(error)
+              ? 'Données hors ligne indisponibles.'
+              : 'Impossible de charger les données : $error';
+          _isLoading = false;
+        });
+      }
     } finally {
       if (mounted) {
         setState(() => _isRefreshing = false);
       }
     }
     _refreshPendingActionsCount();
+  }
+
+  Future<bool> _loadOfflineSnapshot({bool triggerBanner = false}) async {
+    final overview = await _repository.readCachedCompanyOverview();
+    final membership = overview?.membership;
+    if (overview == null || membership?.companyId == null) {
+      return false;
+    }
+    final warehouses = await _repository.readCachedWarehouses() ?? _warehouses;
+    final inventory =
+        await _repository.readCachedInventoryEntries() ?? _inventory;
+    final equipment = await _repository.readCachedEquipment() ?? _equipment;
+    final purchaseRequests =
+        await _repository.readCachedPurchaseRequests() ?? _purchaseRequests;
+    var joinCodes = await _repository.readCachedJoinCodes() ?? _joinCodes;
+    if (_pendingJoinCodeDeletes.isNotEmpty) {
+      joinCodes = joinCodes
+          .where((code) => !_pendingJoinCodeDeletes.contains(code.id))
+          .toList(growable: false);
+    }
+    final invites = await _repository.readCachedInvites() ?? _invites;
+    final profile = await _repository.readCachedUserProfile() ?? _userProfile;
+
+    if (!mounted) {
+      return true;
+    }
+    setState(() {
+      _overview = overview;
+      _warehouses = warehouses;
+      _inventory = inventory;
+      _equipment = equipment;
+      _purchaseRequests = purchaseRequests;
+      _joinCodes = joinCodes;
+      _invites = invites;
+      _userProfile = profile;
+      _missingTables = const <String>[];
+      _recalculateLowStockItems(inventory);
+      _isLoading = false;
+    });
+    if (triggerBanner) {
+      _showOfflineBannerTemporarily();
+    }
+    return true;
+  }
+
+  void _recalculateLowStockItems(List<InventoryEntry> inventory) {
+    final lowStock = <InventoryEntry>[];
+    for (final entry in inventory) {
+      final meta = entry.item['meta'] as Map?;
+      final minStock = (meta?['min_stock'] as num?)?.toInt();
+      if (minStock != null && entry.totalQty < minStock) {
+        lowStock.add(entry);
+      }
+    }
+    setState(() => _lowStockItems = lowStock);
+  }
+
+  void _showOfflineBannerTemporarily() {
+    if (!mounted) return;
+    _offlineBannerTimer?.cancel();
+    setState(() => _offlineBannerVisible = true);
+    _offlineBannerTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) return;
+      setState(() => _offlineBannerVisible = false);
+    });
+  }
+
+  Future<void> _handleDeleteAccount() async {
+    if (_isDeletingAccount) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Supprimer mon compte'),
+        content: const Text(
+          'Cette action supprimera définitivement votre compte Logtek G&I '
+          'ainsi que vos données personnelles. Elle est irréversible. '
+          'Veux-tu continuer ?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Supprimer définitivement'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() => _isDeletingAccount = true);
+    final result = await _commands.deleteAccount();
+    if (!result.ok) {
+      if (mounted) {
+        setState(() => _isDeletingAccount = false);
+        _showSnack(
+          _describeError(result.error) ??
+              'Une erreur est survenue lors de la suppression du compte.',
+          error: true,
+        );
+      }
+      return;
+    }
+
+    final userId = Supa.i.auth.currentUser?.id;
+    if (userId != null) {
+      await OfflineStorage.instance.clearUserCache(userId);
+    }
+    await Supa.i.auth.signOut();
+    if (!mounted) return;
+    setState(() => _isDeletingAccount = false);
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const SignInPage()),
+      (route) => false,
+    );
   }
 
   @override
@@ -279,6 +493,22 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
     final membership = _overview?.membership;
     if (membership == null || membership.companyId == null) {
+      final user = Supa.i.auth.currentUser;
+      String? profileValue(String key) {
+        final raw = _userProfile?[key];
+        if (raw is String) {
+          final trimmed = raw.trim();
+          if (trimmed.isNotEmpty) return trimmed;
+        }
+        return null;
+      }
+
+      String? onboardingName = profileValue('full_name');
+      onboardingName ??= profileValue('display_name');
+
+      String? onboardingEmail = profileValue('email');
+      onboardingEmail ??= user?.email;
+
       return _OnboardingView(
         creatingCompany: _creatingCompany,
         joiningCompany: _joiningCompany,
@@ -290,6 +520,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         isOnline: _isOnline,
         missingTables: _missingTables,
         transientError: _transientError,
+        userName: onboardingName,
+        userEmail: onboardingEmail,
+        onSignOut: _handleSignOut,
+        onDeleteAccount: _handleDeleteAccount,
+        isDeletingAccount: _isDeletingAccount,
       );
     }
 
@@ -375,7 +610,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   _AsyncCallback? _fabActionForCurrentTab() {
     switch (_currentTab) {
       case _GateTab.home:
-        return _showHomeFabMenu;
+        return null; // Pas de bouton + sur l'accueil
       case _GateTab.list:
         return _promptCreatePurchaseRequest;
       case _GateTab.inventory:
@@ -424,7 +659,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     );
 
     final banners = <Widget>[];
-    if (!_isOnline) {
+    if (_offlineBannerVisible) {
       banners.add(_StatusBanner.warning(
         icon: Icons.wifi_off,
         message: 'Mode hors ligne : les données peuvent être périmées.',
@@ -511,8 +746,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
   Future<CopilotFeedback?> _executeCopilotIntent(CopilotIntent intent) async {
     try {
-      final quickActionFeedback =
-          await _copilotMaybeHandleQuickAction(intent);
+      final quickActionFeedback = await _copilotMaybeHandleQuickAction(intent);
       if (quickActionFeedback != null) return quickActionFeedback;
 
       if (intent.type == CopilotIntentType.unknown) {
@@ -581,7 +815,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
     if (wantsMarkExisting) {
       if (name == null || name.trim().isEmpty) {
-        const message = 'Précise quelle demande doit être marquée comme achetée.';
+        const message =
+            'Précise quelle demande doit être marquée comme achetée.';
         return const CopilotFeedback(message: message, isError: true);
       }
       final target = _copilotFindPurchaseRequestByName(name);
@@ -595,8 +830,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     final note = _copilotPickString(payload, ['note', 'comment']) ??
         intent.rawText ??
         name;
-    final warehouseHint =
-        _copilotPickString(payload, ['warehouse', 'warehouse_name', 'entrepot']);
+    final warehouseHint = _copilotPickString(
+        payload, ['warehouse', 'warehouse_name', 'entrepot']);
     final sectionHint =
         _copilotPickString(payload, ['section', 'section_name']);
     if (name == null || name.trim().isEmpty || qty == null || qty <= 0) {
@@ -739,8 +974,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
   Future<CopilotFeedback?> _copilotMaybeHandleQuickAction(
       CopilotIntent intent) async {
-    final normalized =
-        _copilotNormalizeText(intent.rawText ?? intent.summary);
+    final normalized = _copilotNormalizeText(intent.rawText ?? intent.summary);
     if (normalized.isEmpty) return null;
     final mentionsQuickActions = _copilotContainsAny(
       normalized,
@@ -811,8 +1045,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         ) ??
         _inferItemName(rawText);
     if (candidateName == null || candidateName.trim().isEmpty) {
-      const message =
-          'Précise le nom de la pièce à marquer comme achetée.';
+      const message = 'Précise le nom de la pièce à marquer comme achetée.';
       _showSnack(message, error: true);
       return const CopilotFeedback(message: message, isError: true);
     }
@@ -847,7 +1080,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (delta == null || delta == 0) {
       delta = await _copilotPromptQuantity(
         title: 'Quelle quantité ajuster ?',
-        description: 'Indique le nombre à ajouter (positif) ou retirer (négatif).',
+        description:
+            'Indique le nombre à ajouter (positif) ou retirer (négatif).',
       );
     }
     if (delta == null || delta == 0) {
@@ -872,12 +1106,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       _showSnack(message, error: true);
       return const CopilotFeedback(message: message, isError: true);
     }
-    final warehouseHint =
-        _copilotPickString(payload, ['warehouse', 'entrepot', 'warehouse_name']);
+    final warehouseHint = _copilotPickString(
+        payload, ['warehouse', 'entrepot', 'warehouse_name']);
     final sectionHint =
         _copilotPickString(payload, ['section', 'section_name']);
-    var warehouseId =
-        _resolveWarehouseForEntry(entry, hint: warehouseHint);
+    var warehouseId = _resolveWarehouseForEntry(entry, hint: warehouseHint);
     warehouseId ??= await _copilotPromptWarehouse(entry);
     if (warehouseId == null) {
       const message = 'Entrepôt requis pour cette pièce.';
@@ -898,8 +1131,9 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       return const CopilotFeedback(message: message, isError: true);
     }
 
-    final itemLabel =
-        entry.item['name']?.toString() ?? entry.item['sku']?.toString() ?? 'Pièce';
+    final itemLabel = entry.item['name']?.toString() ??
+        entry.item['sku']?.toString() ??
+        'Pièce';
     final lines = [
       'Pièce : $itemLabel',
       'Quantité : ${delta > 0 ? '+$delta' : delta}',
@@ -1010,25 +1244,22 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           payload,
           ['task', 'task_name', 'action', 'note'],
         ) ??
-        (intent.summary.isNotEmpty
-            ? intent.summary
-            : 'Tâche mécanique');
+        (intent.summary.isNotEmpty ? intent.summary : 'Tâche mécanique');
     final delay =
         _copilotPickInt(payload, ['delay_days', 'delai', 'due_in']) ?? 7;
-    final repeat =
-        _copilotPickInt(payload, ['repeat_days', 'repeat_every']);
-    final priority =
-        _normalizePriority(_copilotPickString(payload, ['priority']) ?? 'moyen');
+    final repeat = _copilotPickInt(payload, ['repeat_days', 'repeat_every']);
+    final priority = _normalizePriority(
+        _copilotPickString(payload, ['priority']) ?? 'moyen');
     final task = <String, dynamic>{
       'id': 'copilot_${DateTime.now().microsecondsSinceEpoch}',
       'title': taskTitle,
       'delay_days': delay <= 0 ? 1 : delay,
       'priority': priority,
       'created_at': DateTime.now().toIso8601String(),
+      'is_recheck': false,
       if (repeat != null && repeat > 0) 'repeat_every_days': repeat,
     };
-    final equipmentLabel =
-        equipment['name']?.toString() ?? 'Équipement';
+    final equipmentLabel = equipment['name']?.toString() ?? 'Équipement';
     existingTasks.add(task);
     meta['mechanic_tasks'] = existingTasks;
     final events = [
@@ -1050,8 +1281,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       'Tâche : $taskTitle',
       'Priorité : ${priority.toUpperCase()}',
       'Délai : ${task['delay_days']} jour(s)',
-      if (repeat != null && repeat > 0)
-        'Rappel : tous les $repeat jour(s)',
+      if (repeat != null && repeat > 0) 'Rappel : tous les $repeat jour(s)',
     ];
     final confirmed = await _confirmCopilotAction(
       title: 'Ajouter cette tâche ?',
@@ -1066,7 +1296,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       equipment: equipment,
       nextMeta: meta,
       events: events,
-      successMessage: 'Tâche mécanique ajoutée par Copilot.',
+      successMessage: 'Tâche mécanique ajoutée par LogAI.',
     );
   }
 
@@ -1458,18 +1688,29 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     return null;
   }
 
-  Future<CopilotFeedback?> _applyEquipmentMetaUpdate({
+  Future<_MetaUpdateOutcome> _persistEquipmentMetaUpdate({
     required Map<String, dynamic> equipment,
     required Map<String, dynamic> nextMeta,
-    required List<Map<String, dynamic>> events,
-    required String successMessage,
+    List<Map<String, dynamic>> events = const <Map<String, dynamic>>[],
+    String successMessage = 'Équipement mis à jour.',
+    String offlineMessage = 'Mise à jour en file (hors ligne).',
+    String? errorFallbackMessage,
+    bool showSuccessSnack = true,
+    bool showOfflineSnack = true,
+    bool refreshOnSuccess = true,
   }) async {
     final equipmentId = equipment['id']?.toString();
-    if (equipmentId == null) {
+    if (equipmentId == null || equipmentId.isEmpty) {
       const message = 'Équipement inconnu.';
       _showSnack(message, error: true);
-      return const CopilotFeedback(message: message, isError: true);
+      return (
+        ok: false,
+        message: message,
+        isError: true,
+        queuedOffline: false,
+      );
     }
+
     if (_isOnline) {
       final result = await _commands.updateEquipmentMeta(
         equipmentId: equipmentId,
@@ -1477,9 +1718,15 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       );
       if (!result.ok || result.data == null) {
         final message = _describeError(result.error) ??
+            errorFallbackMessage ??
             'Impossible de mettre à jour cet équipement.';
         _showSnack(message, error: true);
-        return CopilotFeedback(message: message, isError: true);
+        return (
+          ok: false,
+          message: message,
+          isError: true,
+          queuedOffline: false,
+        );
       }
       _replaceEquipment(result.data!);
       for (final event in events) {
@@ -1496,39 +1743,89 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
               : null,
         );
       }
-      await _refreshAll();
-      _showSnack(successMessage);
-      return CopilotFeedback(message: successMessage);
-    } else {
-      final companyId = _overview?.membership?.companyId;
-      if (companyId == null) {
-        const message = 'Entreprise inconnue.';
-        _showSnack(message, error: true);
-        return const CopilotFeedback(message: message, isError: true);
+      if (refreshOnSuccess) {
+        await _refreshAll();
       }
-      final local = Map<String, dynamic>.from(equipment)
-        ..['meta'] = nextMeta;
-      _replaceEquipment(local);
-      await OfflineActionsService.instance.enqueue(
-        OfflineActionTypes.equipmentMetaUpdate,
-        {
-          'company_id': companyId,
-          'equipment_id': equipmentId,
-          'meta': nextMeta,
-          if (events.isNotEmpty) 'events': events,
-        },
+      if (showSuccessSnack && successMessage.isNotEmpty) {
+        _showSnack(successMessage);
+      }
+      return (
+        ok: true,
+        message: successMessage,
+        isError: false,
+        queuedOffline: false,
       );
-      await _refreshPendingActionsCount();
-      _showOfflineQueuedSnack(successMessage);
-      return CopilotFeedback(message: successMessage);
     }
+
+    final companyId = _overview?.membership?.companyId;
+    if (companyId == null) {
+      const message = 'Entreprise inconnue.';
+      _showSnack(message, error: true);
+      return (
+        ok: false,
+        message: message,
+        isError: true,
+        queuedOffline: false,
+      );
+    }
+
+    final local = Map<String, dynamic>.from(equipment)..['meta'] = nextMeta;
+    _replaceEquipment(local);
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.equipmentMetaUpdate,
+      {
+        'company_id': companyId,
+        'equipment_id': equipmentId,
+        'equipment_name': equipment['name']?.toString(),
+        'meta': nextMeta,
+        if (events.isNotEmpty) 'events': events,
+      },
+    );
+    await _refreshPendingActionsCount();
+    if (showOfflineSnack && offlineMessage.isNotEmpty) {
+      _showOfflineQueuedSnack(offlineMessage);
+    }
+    return (
+      ok: true,
+      message: offlineMessage,
+      isError: false,
+      queuedOffline: true,
+    );
+  }
+
+  Future<CopilotFeedback?> _applyEquipmentMetaUpdate({
+    required Map<String, dynamic> equipment,
+    required Map<String, dynamic> nextMeta,
+    required List<Map<String, dynamic>> events,
+    required String successMessage,
+  }) async {
+    final offlineMessage = successMessage.isEmpty
+        ? 'Action enregistrée (hors ligne).'
+        : '$successMessage (hors ligne).';
+    final outcome = await _persistEquipmentMetaUpdate(
+      equipment: equipment,
+      nextMeta: nextMeta,
+      events: events,
+      successMessage: successMessage,
+      offlineMessage: offlineMessage,
+      errorFallbackMessage: 'Impossible de mettre à jour cet équipement.',
+      showSuccessSnack: true,
+      showOfflineSnack: true,
+      refreshOnSuccess: true,
+    );
+    if (outcome.ok) {
+      final message = outcome.queuedOffline ? offlineMessage : successMessage;
+      return CopilotFeedback(message: message);
+    }
+    return CopilotFeedback(message: outcome.message, isError: true);
   }
 
   String _normalizePriority(String raw) {
     final normalized = _normalizeLabel(raw);
     if (normalized.contains('haut') ||
         normalized.contains('urgent') ||
-        normalized.contains('élev')) {
+        normalized.contains('élev') ||
+        normalized.contains('elev')) {
       return 'eleve';
     }
     if (normalized.contains('faible') || normalized.contains('low')) {
@@ -1605,8 +1902,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     String warehouseId,
   ) async {
     if (!mounted) return null;
-    final sections =
-        entry.sectionSplit[warehouseId] ?? const <String, int>{};
+    final sections = entry.sectionSplit[warehouseId] ?? const <String, int>{};
     final options = sections.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
     return showDialog<String>(
@@ -1660,8 +1956,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   }
 
   String _sectionLabel(String warehouseId, String? sectionId) {
-    if (sectionId == null ||
-        sectionId == InventoryEntry.unassignedSectionKey) {
+    if (sectionId == null || sectionId == InventoryEntry.unassignedSectionKey) {
       return 'Sans section';
     }
     return _sectionNameById(warehouseId, sectionId) ?? 'Section';
@@ -1722,15 +2017,13 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
   Future<Map<String, dynamic>?> _copilotPromptEquipmentSelection() async {
     if (!mounted || _equipment.isEmpty) return null;
-    final sorted = _equipment
-        .map((item) => Map<String, dynamic>.from(item))
-        .toList()
-      ..sort(
-        (a, b) =>
-            (a['name']?.toString() ?? '')
+    final sorted =
+        _equipment.map((item) => Map<String, dynamic>.from(item)).toList()
+          ..sort(
+            (a, b) => (a['name']?.toString() ?? '')
                 .toLowerCase()
                 .compareTo((b['name']?.toString() ?? '').toLowerCase()),
-      );
+          );
     return showModalBottomSheet<Map<String, dynamic>>(
       context: context,
       isScrollControlled: true,
@@ -1758,8 +2051,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                       separatorBuilder: (_, __) => const Divider(height: 1),
                       itemBuilder: (context, index) {
                         final equip = sorted[index];
-                        final title =
-                            equip['name']?.toString() ?? 'Équipement';
+                        final title = equip['name']?.toString() ?? 'Équipement';
                         final brand = equip['brand']?.toString();
                         final model = equip['model']?.toString();
                         final serial = equip['serial']?.toString();
@@ -1842,7 +2134,9 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           inventory: _inventory,
           equipment: _equipment,
           userProfile: _userProfile,
+          lowStockItems: _lowStockItems,
           onQuickAction: _handleQuickAction,
+          onViewLowStock: _handleShowLowStockPage,
         );
       case _GateTab.list:
         final pendingRequests = _purchaseRequests
@@ -1860,6 +2154,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
               _handleAdjustPurchaseRequestQty(request, 1),
           onDecreaseQty: (request) =>
               _handleAdjustPurchaseRequestQty(request, -1),
+          onShowDetails: _handleEditPurchaseRequest,
           onDeleteRequest: _handleDeletePurchaseRequest,
           onMarkPurchased: _handleMarkPurchaseRequestPurchased,
           updatingRequestIds: _updatingPurchaseRequests,
@@ -1874,18 +2169,28 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           onPlaceRequest: _handlePlacePurchaseRequest,
           updatingRequestIds: _updatingPurchaseRequests,
           onManageWarehouse: _handleManageWarehouse,
+          onAddTask: _addInventoryTask,
+          onToggleTask: _toggleInventoryTask,
+          onDeleteTask: _deleteInventoryTask,
+          ensureItemForTask: _ensureItemForTask,
         );
       case _GateTab.equipment:
         return _EquipmentTab(
           equipment: _equipment,
           commands: _commands,
           onRefresh: _refreshAll,
+          inventory: _inventory,
+          warehouses: _warehouses,
+          onReplaceEquipment: _replaceEquipment,
+          onRemoveEquipment: _removeEquipment,
           companyId: membership.companyId,
+          equipmentProvider: () => _equipment,
         );
       case _GateTab.more:
         return _MoreTab(
           membership: membership,
           members: _overview?.members ?? const <Map<String, dynamic>>[],
+          equipment: _equipment,
           joinCodes: _joinCodes,
           invites: _invites,
           userProfile: _userProfile,
@@ -1893,6 +2198,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           onInviteMember: _promptInviteMember,
           onShowCompanyJournal: _handleShowCompanyJournal,
           onDeleteJoinCode: _handleDeleteJoinCode,
+          onAssignEquipment: _handleAssignEquipmentToMember,
+          onChangeMemberRole: _handleChangeMemberRole,
+          onRemoveMember: _handleRemoveMember,
+          onDeleteAccount: _handleDeleteAccount,
+          isDeletingAccount: _isDeletingAccount,
         );
     }
   }
@@ -1987,6 +2297,26 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                 dialogError = null;
               });
 
+              if (!_isOnline) {
+                final created = await _createWarehouseOffline(
+                  companyId: companyId,
+                  name: nameCtrl.text.trim(),
+                  code: codeCtrl.text.trim().isEmpty
+                      ? null
+                      : codeCtrl.text.trim(),
+                );
+                if (created == null) {
+                  setDialogState(() {
+                    submitting = false;
+                    dialogError = 'Action hors ligne impossible.';
+                  });
+                  return;
+                }
+                if (!context.mounted || !mounted) return;
+                Navigator.of(context).pop();
+                return;
+              }
+
               final result = await _commands.createWarehouse(
                 companyId: companyId,
                 name: nameCtrl.text.trim(),
@@ -2074,33 +2404,37 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     final name = warehouse['name']?.toString() ?? 'Entrepôt';
     await showModalBottomSheet<void>(
       context: context,
+      backgroundColor: Colors.white,
       builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.edit),
-                title: const Text('Renommer'),
-                onTap: () async {
-                  Navigator.of(context).pop();
-                  await _promptRenameWarehouse(warehouse);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.delete_outline, color: Colors.red),
-                title: const Text('Supprimer'),
-                onTap: () async {
-                  Navigator.of(context).pop();
-                  await _handleDeleteWarehouse(warehouseId, name);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.close),
-                title: const Text('Annuler'),
-                onTap: () => Navigator.of(context).pop(),
-              ),
-            ],
+        return Container(
+          color: Colors.white,
+          child: SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.edit),
+                  title: const Text('Renommer'),
+                  onTap: () async {
+                    Navigator.of(context).pop();
+                    await _promptRenameWarehouse(warehouse);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.delete_outline, color: Colors.red),
+                  title: const Text('Supprimer'),
+                  onTap: () async {
+                    Navigator.of(context).pop();
+                    await _handleDeleteWarehouse(warehouseId, name);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('Annuler'),
+                  onTap: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
           ),
         );
       },
@@ -2148,7 +2482,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                 });
                 return;
               }
-              if (!mounted) return;
+              if (!context.mounted) return;
               Navigator.of(context).pop(true);
               _showSnack('Entrepôt renommé.');
               await _refreshAll();
@@ -2253,7 +2587,6 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     await _refreshAll();
   }
 
-
   Future<void> _promptCreateInventorySection(
       Map<String, dynamic> warehouse) async {
     final companyId = _overview?.membership?.companyId;
@@ -2269,6 +2602,14 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         warehouseId: warehouseId,
         warehouseName: warehouseName,
         describeError: _describeError,
+        isOnline: _isOnline,
+        onCreateOffline: ({required String name, String? code}) =>
+            _createInventorySectionOffline(
+          companyId: companyId,
+          warehouseId: warehouseId,
+          name: name,
+          code: code,
+        ),
       ),
     );
     if (created != null && mounted) {
@@ -2412,14 +2753,32 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   }
 
   Future<void> _promptCreateEquipment() async {
-    final companyId = _overview?.membership?.companyId;
+    final companyId = await _resolveCompanyId();
     if (companyId == null) return;
-
+    if (!mounted) return;
     final formKey = GlobalKey<FormState>();
     final nameCtrl = TextEditingController();
     final brandCtrl = TextEditingController();
     final modelCtrl = TextEditingController();
     final serialCtrl = TextEditingController();
+    final yearCtrl = TextEditingController();
+    const equipmentTypes = <String>[
+      'Abatteuse',
+      'Débardeur',
+      'Camion transporteur',
+      'Camion pick-up',
+      'Bouteur',
+      'Chargeuse',
+      'Chargeuse sur pneus',
+      'Excavatrice',
+      'Tracteur',
+      'Niveleuse',
+      'Remorque',
+      'Planteuse',
+      'Débroussailleuse',
+      'Autres',
+    ];
+    String selectedType = equipmentTypes.last;
     var submitting = false;
     String? dialogError;
 
@@ -2435,12 +2794,45 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                 dialogError = null;
               });
 
+              if (!_isOnline) {
+                final created = await _createEquipmentOffline(
+                  companyId: companyId,
+                  name: nameCtrl.text.trim(),
+                  brand: brandCtrl.text.trim().isEmpty
+                      ? null
+                      : brandCtrl.text.trim(),
+                  model: modelCtrl.text.trim().isEmpty
+                      ? null
+                      : modelCtrl.text.trim(),
+                  serial: serialCtrl.text.trim().isEmpty
+                      ? null
+                      : serialCtrl.text.trim(),
+                  type: selectedType,
+                  year: yearCtrl.text.trim().isEmpty
+                      ? null
+                      : yearCtrl.text.trim(),
+                );
+                if (created == null) {
+                  setDialogState(() {
+                    submitting = false;
+                    dialogError = 'Action hors ligne impossible.';
+                  });
+                  return;
+                }
+                if (!context.mounted || !mounted) return;
+                Navigator.of(context).pop();
+                _showSnack('Équipement ajouté (hors ligne).');
+                return;
+              }
+
               final result = await _commands.createEquipment(
                 companyId: companyId,
                 name: nameCtrl.text.trim(),
                 brand: brandCtrl.text.trim(),
                 model: modelCtrl.text.trim(),
                 serial: serialCtrl.text.trim(),
+                type: selectedType,
+                year: yearCtrl.text.trim(),
               );
 
               if (!result.ok) {
@@ -2497,9 +2889,44 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
+                        controller: yearCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration:
+                            const InputDecoration(labelText: 'Année (optionnel)'),
+                        validator: (value) {
+                          if (value == null || value.trim().isEmpty) {
+                            return null;
+                          }
+                          final parsed = int.tryParse(value.trim());
+                          if (parsed == null || parsed < 1900 || parsed > 2100) {
+                            return 'Année invalide';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      TextFormField(
                         controller: serialCtrl,
                         decoration: const InputDecoration(
                             labelText: 'Numéro de série (optionnel)'),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        value: selectedType,
+                        items: equipmentTypes
+                            .map(
+                              (type) => DropdownMenuItem(
+                                value: type,
+                                child: Text(type),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (value) {
+                          if (value == null || value.isEmpty) return;
+                          setDialogState(() => selectedType = value);
+                        },
+                        decoration:
+                            const InputDecoration(labelText: 'Type'),
                       ),
                       if (dialogError != null) ...[
                         const SizedBox(height: 12),
@@ -2533,7 +2960,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     );
   }
 
-  Future<void> _promptCreatePurchaseRequest() async {
+  Future<void> _promptCreatePurchaseRequest({
+    String? initialName,
+    String? initialWarehouseId,
+    String? initialSectionId,
+  }) async {
     final companyId = _overview?.membership?.companyId;
     if (companyId == null) return;
 
@@ -2543,8 +2974,25 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         commands: _commands,
         companyId: companyId,
         warehouses: _warehouses,
+        inventory: _inventory,
         describeError: _describeError,
         isOnline: _isOnline,
+        onCreateItemOffline: ({
+          required String name,
+          String? sku,
+          String? unit,
+          String? category,
+        }) =>
+            _createInventoryItemOffline(
+          companyId: companyId,
+          name: name,
+          sku: sku,
+          unit: unit,
+          category: category,
+        ),
+        initialName: initialName,
+        initialWarehouseId: initialWarehouseId,
+        initialSectionId: initialSectionId,
         onCreateOffline: _isOnline
             ? null
             : ({
@@ -2553,14 +3001,16 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                 String? warehouseId,
                 String? sectionId,
                 String? note,
-              }) =>
-                _createPurchaseRequestOffline(
-                  name: name,
-                  qty: qty,
-                  warehouseId: warehouseId,
-                  sectionId: sectionId,
-                  note: note,
-                ),
+                String? itemId,
+          }) =>
+            _createPurchaseRequestOffline(
+              name: name,
+              qty: qty,
+              warehouseId: warehouseId,
+              sectionId: sectionId,
+              note: note,
+              itemId: itemId ?? '',
+            ),
       ),
     );
 
@@ -2582,6 +3032,9 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           },
         );
         await _refreshAll();
+      } else {
+        // Ensure the new request shows up immediately when created offline.
+        _replacePurchaseRequest(created);
       }
     }
   }
@@ -2632,9 +3085,17 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (id == null) return;
     setState(() {
       _equipment = _equipment
-          .map((equip) =>
-              equip['id']?.toString() == id ? updated : equip)
+          .map((equip) => equip['id']?.toString() == id ? updated : equip)
           .toList();
+    });
+    runDetached(_persistEquipmentCache());
+  }
+
+  void _removeEquipment(String? id) {
+    if (id == null) return;
+    setState(() {
+      _equipment =
+          _equipment.where((equip) => equip['id']?.toString() != id).toList();
     });
     runDetached(_persistEquipmentCache());
   }
@@ -2646,6 +3107,795 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       '$userId::${OfflineCacheKeys.equipment}',
       _equipment,
     );
+  }
+
+  Future<void> _persistInventoryCache() async {
+    final userId = Supa.i.auth.currentUser?.id;
+    if (userId == null) return;
+    final data = _inventory
+        .map((entry) => {
+              'item': entry.item,
+              'totalQty': entry.totalQty,
+              'warehouseSplit': entry.warehouseSplit,
+              'sectionSplit': entry.sectionSplit,
+            })
+        .toList(growable: false);
+    await OfflineStorage.instance.saveCache(
+      '$userId::${OfflineCacheKeys.inventory}',
+      data,
+    );
+  }
+
+  Future<void> _persistWarehousesCache() async {
+    final userId = Supa.i.auth.currentUser?.id;
+    if (userId == null) return;
+    await OfflineStorage.instance.saveCache(
+      '$userId::${OfflineCacheKeys.warehouses}',
+      _warehouses,
+    );
+  }
+
+  Future<Map<String, dynamic>?> _createWarehouseOffline({
+    required String companyId,
+    required String name,
+    String? code,
+  }) async {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) return null;
+    final normalizedCode = code?.trim();
+    final tempId = _generateLocalId('wh');
+    final record = <String, dynamic>{
+      'id': tempId,
+      'company_id': companyId,
+      'name': trimmedName,
+      if (normalizedCode != null && normalizedCode.isNotEmpty)
+        'code': normalizedCode,
+      'active': true,
+      'created_at': DateTime.now().toIso8601String(),
+      'sections': <Map<String, dynamic>>[],
+    };
+    setState(() {
+      _warehouses = [..._warehouses, record];
+    });
+    await _persistWarehousesCache();
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.warehouseCreate,
+      {
+        'temp_id': tempId,
+        'company_id': companyId,
+        'name': trimmedName,
+        if (normalizedCode != null && normalizedCode.isNotEmpty)
+          'code': normalizedCode,
+      },
+    );
+    await _refreshPendingActionsCount();
+    _showOfflineQueuedSnack('Entrepôt ajouté (hors ligne).');
+    return record;
+  }
+
+  Future<Map<String, dynamic>?> _createInventorySectionOffline({
+    required String companyId,
+    required String warehouseId,
+    required String name,
+    String? code,
+  }) async {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) return null;
+    final normalizedCode = code?.trim();
+    final hasWarehouse = _warehouses.any(
+      (warehouse) => warehouse['id']?.toString() == warehouseId,
+    );
+    if (!hasWarehouse) return null;
+    final tempId = _generateLocalId('section');
+    final section = <String, dynamic>{
+      'id': tempId,
+      'company_id': companyId,
+      'warehouse_id': warehouseId,
+      'name': trimmedName,
+      if (normalizedCode != null && normalizedCode.isNotEmpty)
+        'code': normalizedCode,
+      'active': true,
+      'created_at': DateTime.now().toIso8601String(),
+    };
+    setState(() {
+      _warehouses = _warehouses.map((warehouse) {
+        if (warehouse['id']?.toString() != warehouseId) return warehouse;
+        final sections = (warehouse['sections'] as List?)
+                ?.whereType<Map>()
+                .map((raw) => Map<String, dynamic>.from(raw))
+                .toList() ??
+            <Map<String, dynamic>>[];
+        return {
+          ...warehouse,
+          'sections': [...sections, section],
+        };
+      }).toList();
+    });
+    await _persistWarehousesCache();
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.inventorySectionCreate,
+      {
+        'temp_id': tempId,
+        'company_id': companyId,
+        'warehouse_id': warehouseId,
+        'name': trimmedName,
+        if (normalizedCode != null && normalizedCode.isNotEmpty)
+          'code': normalizedCode,
+      },
+    );
+    await _refreshPendingActionsCount();
+    _showOfflineQueuedSnack('Section ajoutée (hors ligne).');
+    return section;
+  }
+
+  Future<InventoryEntry?> _createInventoryItemOffline({
+    required String companyId,
+    required String name,
+    String? sku,
+    String? unit,
+    String? category,
+  }) async {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) return null;
+
+    String? normalize(String? value) {
+      if (value == null) return null;
+      final trimmed = value.trim();
+      return trimmed.isEmpty ? null : trimmed;
+    }
+
+    final normalizedSku = normalize(sku);
+    final normalizedUnit = normalize(unit);
+    final normalizedCategory = normalize(category);
+    final tempId = _generateLocalId('item');
+    final record = <String, dynamic>{
+      'id': tempId,
+      'company_id': companyId,
+      'name': trimmedName,
+      if (normalizedSku != null) 'sku': normalizedSku,
+      if (normalizedUnit != null) 'unit': normalizedUnit,
+      if (normalizedCategory != null) 'category': normalizedCategory,
+      'active': true,
+      'created_at': DateTime.now().toIso8601String(),
+      'meta': <String, dynamic>{},
+    };
+    final entry = InventoryEntry(
+      item: record,
+      totalQty: 0,
+      warehouseSplit: const <String, int>{},
+      sectionSplit: const <String, Map<String, int>>{},
+    );
+    setState(() {
+      _inventory = [..._inventory, entry];
+    });
+    runDetached(_persistInventoryCache());
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.inventoryItemCreate,
+      {
+        'temp_id': tempId,
+        'company_id': companyId,
+        'name': trimmedName,
+        if (normalizedSku != null) 'sku': normalizedSku,
+        if (normalizedUnit != null) 'unit': normalizedUnit,
+        if (normalizedCategory != null) 'category': normalizedCategory,
+      },
+    );
+    await _refreshPendingActionsCount();
+    _showOfflineQueuedSnack('Pièce créée (hors ligne).');
+    return entry;
+  }
+
+  Future<void> _addInventoryTask(
+    String itemId,
+    String title, {
+    Map<String, dynamic>? meta,
+  }) async {
+    final entry = _inventory
+        .firstWhere((e) => e.item['id']?.toString() == itemId, orElse: () => const InventoryEntry(item: {}));
+    if (entry.item.isEmpty) {
+      _showSnack('Pièce introuvable.', error: true);
+      return;
+    }
+    final itemMeta =
+        Map<String, dynamic>.from(entry.item['meta'] as Map? ?? const {});
+    final tasks = (itemMeta['tasks'] as List?)
+            ?.whereType<Map>()
+            .map((raw) => Map<String, dynamic>.from(raw))
+            .toList() ??
+        <Map<String, dynamic>>[];
+    tasks.add({
+      'id': 'task_${DateTime.now().microsecondsSinceEpoch}',
+      'title': title,
+      'created_at': DateTime.now().toIso8601String(),
+      'done': false,
+      if (meta != null) 'meta': meta,
+    });
+    itemMeta['tasks'] = tasks;
+    await _persistItemMeta(
+      itemId: itemId,
+      meta: itemMeta,
+      successMessage: 'Tâche ajoutée.',
+    );
+  }
+
+  Future<void> _toggleInventoryTask(
+    String itemId,
+    String taskId,
+    bool done,
+  ) async {
+    final entry = _inventory
+        .firstWhere((e) => e.item['id']?.toString() == itemId, orElse: () => const InventoryEntry(item: {}));
+    if (entry.item.isEmpty) return;
+    final meta = Map<String, dynamic>.from(entry.item['meta'] as Map? ?? const {});
+    final tasks = (meta['tasks'] as List?)
+            ?.whereType<Map>()
+            .map((raw) => Map<String, dynamic>.from(raw))
+            .toList() ??
+        <Map<String, dynamic>>[];
+    final index = tasks.indexWhere((t) => t['id']?.toString() == taskId);
+    if (index < 0) return;
+    final task = tasks[index];
+    if (!done) {
+      tasks[index]['done'] = false;
+      meta['tasks'] = tasks;
+      await _persistItemMeta(itemId: itemId, meta: meta);
+      return;
+    }
+
+    final taskMeta = task['meta'] as Map?;
+    final isMove = taskMeta?['type']?.toString() == 'move';
+    if (isMove) {
+      final qty = (taskMeta?['qty'] as num?)?.toInt() ?? 1;
+      final fromWh = taskMeta?['from_warehouse_id']?.toString();
+      final toWh = taskMeta?['to_warehouse_id']?.toString();
+      if (qty <= 0 || fromWh == null || toWh == null) {
+        _showSnack('Tâche invalide : données manquantes.', error: true);
+        return;
+      }
+      final fromSection = taskMeta?['from_section_id']?.toString();
+      final toSection = taskMeta?['to_section_id']?.toString();
+      final companyId = _overview?.membership?.companyId;
+      final available = _availableQtyForTask(itemId, fromWh, fromSection);
+      if (available < qty) {
+        _showSnack('Stock insuffisant dans l’entrepôt source.', error: true);
+        return;
+      }
+      if (companyId == null) {
+        _showSnack('Entreprise inconnue.', error: true);
+        return;
+      }
+      if (!_isOnline) {
+        await OfflineActionsService.instance.enqueue(
+          OfflineActionTypes.inventoryStockDelta,
+          {
+            'company_id': companyId,
+            'warehouse_id': fromWh,
+            'item_id': itemId,
+            'delta': -qty,
+            'section_id': _normalizeSectionId(fromSection),
+            'note': task['title']?.toString(),
+            'event': 'stock_delta',
+            'metadata': {
+              'task_id': taskId,
+              'move_task': true,
+              'direction': 'out',
+            },
+          },
+        );
+        await OfflineActionsService.instance.enqueue(
+          OfflineActionTypes.inventoryStockDelta,
+          {
+            'company_id': companyId,
+            'warehouse_id': toWh,
+            'item_id': itemId,
+            'delta': qty,
+            'section_id': _normalizeSectionId(toSection),
+            'note': task['title']?.toString(),
+            'event': 'stock_delta',
+            'metadata': {
+              'task_id': taskId,
+              'move_task': true,
+              'direction': 'in',
+            },
+          },
+        );
+        await _refreshPendingActionsCount();
+      } else {
+        final remove = await _commands.applyStockDelta(
+          companyId: companyId,
+          itemId: itemId,
+          warehouseId: fromWh,
+          delta: -qty,
+          sectionId: _normalizeSectionId(fromSection),
+        );
+        if (!remove.ok) {
+          _showSnack(
+            _describeError(remove.error) ?? 'Impossible de retirer le stock.',
+            error: true,
+          );
+          return;
+        }
+        final add = await _commands.applyStockDelta(
+          companyId: companyId,
+          itemId: itemId,
+          warehouseId: toWh,
+          delta: qty,
+          sectionId: _normalizeSectionId(toSection),
+        );
+        if (!add.ok) {
+          await _commands.applyStockDelta(
+            companyId: companyId,
+            itemId: itemId,
+            warehouseId: fromWh,
+            delta: qty,
+            sectionId: _normalizeSectionId(fromSection),
+          );
+          _showSnack(
+            _describeError(add.error) ?? 'Impossible d’ajouter le stock.',
+            error: true,
+          );
+          return;
+        }
+      }
+    }
+
+    // Remove the task once completed (move done or simple task).
+    tasks.removeAt(index);
+    meta['tasks'] = tasks;
+    await _persistItemMeta(
+      itemId: itemId,
+      meta: meta,
+      successMessage: 'Tâche complétée.',
+    );
+  }
+
+  Future<void> _deleteInventoryTask(String itemId, String taskId) async {
+    final entry = _inventory
+        .firstWhere((e) => e.item['id']?.toString() == itemId, orElse: () => const InventoryEntry(item: {}));
+    if (entry.item.isEmpty) return;
+    final meta = Map<String, dynamic>.from(entry.item['meta'] as Map? ?? const {});
+    final tasks = (meta['tasks'] as List?)
+            ?.whereType<Map>()
+            .map((raw) => Map<String, dynamic>.from(raw))
+            .toList() ??
+        <Map<String, dynamic>>[];
+    tasks.removeWhere((t) => t['id']?.toString() == taskId);
+    meta['tasks'] = tasks;
+    await _persistItemMeta(itemId: itemId, meta: meta, successMessage: 'Tâche supprimée.');
+  }
+
+  Future<void> _persistItemMeta({
+    required String itemId,
+    required Map<String, dynamic> meta,
+    String? successMessage,
+  }) async {
+    Future<void> queueOfflineUpdate() async {
+      _applyLocalInventoryMeta(itemId, meta);
+      await OfflineActionsService.instance.enqueue(
+        OfflineActionTypes.inventoryItemMetaUpdate,
+        {
+          'item_id': itemId,
+          'meta': meta,
+        },
+      );
+      await _refreshPendingActionsCount();
+      final offlineMessage = successMessage == null || successMessage.isEmpty
+          ? 'Mise à jour en file (hors ligne).'
+          : '$successMessage (hors ligne).';
+      _showOfflineQueuedSnack(offlineMessage);
+    }
+
+    if (!_isOnline) {
+      await queueOfflineUpdate();
+      return;
+    }
+
+    final result = await _commands.updateItemMeta(
+      itemId: itemId,
+      meta: meta,
+    );
+    if (!result.ok || result.data == null) {
+      if (_isNetworkError(result.error)) {
+        await queueOfflineUpdate();
+        return;
+      }
+      _showSnack(
+        _describeError(result.error) ?? 'Impossible de mettre à jour la pièce.',
+        error: true,
+      );
+      return;
+    }
+    final serverMeta = result.data?['meta'];
+    final appliedMeta = serverMeta is Map
+        ? Map<String, dynamic>.from(serverMeta)
+        : meta;
+    _applyLocalInventoryMeta(itemId, appliedMeta);
+    if (successMessage != null) {
+      _showSnack(successMessage);
+    }
+  }
+
+  void _applyLocalInventoryMeta(String itemId, Map<String, dynamic> meta) {
+    setState(() {
+      _inventory = _inventory.map((entry) {
+        if (entry.item['id']?.toString() != itemId) return entry;
+        final newItem = Map<String, dynamic>.from(entry.item)..['meta'] = meta;
+        return InventoryEntry(
+          item: newItem,
+          totalQty: entry.totalQty,
+          warehouseSplit: entry.warehouseSplit,
+          sectionSplit: entry.sectionSplit,
+        );
+      }).toList();
+      _recalculateLowStockItems(_inventory);
+    });
+    runDetached(_persistInventoryCache());
+  }
+
+  int _availableQtyForTask(
+    String itemId,
+    String warehouseId,
+    String? sectionId,
+  ) {
+    final entry = _inventory
+        .firstWhere((e) => e.item['id']?.toString() == itemId, orElse: () => const InventoryEntry(item: {}));
+    if (entry.item.isEmpty) return 0;
+    if (sectionId != null && sectionId != InventoryEntry.unassignedSectionKey) {
+      return entry.sectionSplit[warehouseId]?[sectionId] ?? 0;
+    }
+    return entry.warehouseSplit[warehouseId] ?? 0;
+  }
+
+  Future<String?> _ensureItemForTask(String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return null;
+    // Try find existing
+    for (final entry in _inventory) {
+      final entryName = entry.item['name']?.toString();
+      if (entryName != null &&
+          entryName.trim().toLowerCase() == trimmed.toLowerCase()) {
+        return entry.item['id']?.toString();
+      }
+    }
+    // Create new (online or offline)
+    final companyId = _overview?.membership?.companyId;
+    if (companyId == null) return null;
+    if (_isOnline) {
+      final result = await _commands.createItem(
+        companyId: companyId,
+        name: trimmed,
+      );
+      if (!result.ok) {
+        _showSnack(
+          _describeError(result.error) ?? 'Impossible de créer la pièce.',
+          error: true,
+        );
+        return null;
+      }
+      final newId = result.data?['id']?.toString();
+      if (newId != null) {
+        await _refreshAll();
+      }
+      return newId;
+    } else {
+      final entry = await _createInventoryItemOffline(
+        companyId: companyId,
+        name: trimmed,
+      );
+      return entry?.item['id']?.toString();
+    }
+  }
+
+  Future<Map<String, dynamic>?> _createEquipmentOffline({
+    required String companyId,
+    required String name,
+    String? brand,
+    String? model,
+    String? serial,
+    String? type,
+    String? year,
+  }) async {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) return null;
+    final normalizedBrand = brand?.trim();
+    final normalizedModel = model?.trim();
+    final normalizedSerial = serial?.trim();
+    final tempId = _generateLocalId('equip');
+    final record = <String, dynamic>{
+      'id': tempId,
+      'company_id': companyId,
+      'name': trimmedName,
+      if (normalizedBrand != null && normalizedBrand.isNotEmpty)
+        'brand': normalizedBrand,
+      if (normalizedModel != null && normalizedModel.isNotEmpty)
+        'model': normalizedModel,
+      if (normalizedSerial != null && normalizedSerial.isNotEmpty)
+        'serial': normalizedSerial,
+      'active': true,
+      'created_at': DateTime.now().toIso8601String(),
+      'meta': {
+        if (type != null && type.isNotEmpty) 'type': type,
+        if (year != null && year.isNotEmpty) 'year': year,
+      },
+    };
+    setState(() {
+      _equipment = [..._equipment, record];
+    });
+    await _persistEquipmentCache();
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.equipmentCreate,
+      {
+        'temp_id': tempId,
+        'company_id': companyId,
+        'name': trimmedName,
+        if (normalizedBrand != null && normalizedBrand.isNotEmpty)
+        'brand': normalizedBrand,
+      if (normalizedModel != null && normalizedModel.isNotEmpty)
+        'model': normalizedModel,
+      if (normalizedSerial != null && normalizedSerial.isNotEmpty)
+        'serial': normalizedSerial,
+      if ((type != null && type.isNotEmpty) ||
+          (year != null && year.isNotEmpty))
+        'meta': {
+          if (type != null && type.isNotEmpty) 'type': type,
+          if (year != null && year.isNotEmpty) 'year': year,
+        },
+      },
+    );
+    await _refreshPendingActionsCount();
+    _showOfflineQueuedSnack('Équipement ajouté (hors ligne).');
+    return record;
+  }
+
+  Future<bool> _placePurchaseRequestOffline({
+    required Map<String, dynamic> request,
+    required String requestId,
+    required String companyId,
+    required String itemId,
+    required String warehouseId,
+    String? sectionId,
+    required int qty,
+  }) async {
+    final note = request['name']?.toString();
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.inventoryStockDelta,
+      {
+        'company_id': companyId,
+        'warehouse_id': warehouseId,
+        'item_id': itemId,
+        'delta': qty,
+        'section_id': sectionId,
+        'note': note,
+        'action': 'purchase_place',
+        'metadata': {
+          'request_id': requestId,
+        },
+        'event': 'purchase_stock_added',
+      },
+    );
+
+    final patch = <String, dynamic>{
+      'status': 'done',
+      'item_id': itemId,
+      'warehouse_id': warehouseId,
+      'section_id': sectionId,
+    };
+
+    final updated = await _updatePurchaseRequestLocally(requestId, patch);
+    _applyLocalInventoryDelta(
+      itemId: itemId,
+      itemName: request['name']?.toString() ?? 'Pièce',
+      warehouseId: warehouseId,
+      sectionId: sectionId,
+      delta: qty,
+      meta: request['meta'] is Map ? Map<String, dynamic>.from(request['meta']) : const {},
+    );
+    await OfflineActionsService.instance.enqueue(
+      OfflineActionTypes.purchaseRequestUpdate,
+      {
+        'request_id': requestId,
+        'patch': patch,
+        'log': {
+          'event': 'purchase_request_completed',
+          'note': note,
+          'payload': {
+            'request_id': requestId,
+            'item_id': itemId,
+            'warehouse_id': warehouseId,
+            'section_id': sectionId,
+            'status': 'done',
+            'qty': qty,
+          },
+        },
+      },
+    );
+    await _refreshPendingActionsCount();
+    _showOfflineQueuedSnack('Pièce placée (hors ligne).');
+    return updated != null;
+  }
+
+  void _applyLocalInventoryDelta({
+    required String itemId,
+    required String itemName,
+    required String warehouseId,
+    String? sectionId,
+    required int delta,
+    Map<String, dynamic>? meta,
+  }) {
+    final sectionsKey = sectionId ?? InventoryEntry.unassignedSectionKey;
+    final updated = <InventoryEntry>[];
+    var matched = false;
+
+    for (final entry in _inventory) {
+      final id = entry.item['id']?.toString();
+      if (id != itemId) {
+        updated.add(entry);
+        continue;
+      }
+      matched = true;
+      final newTotal = (entry.totalQty + delta).clamp(0, 1 << 30);
+      final newWarehouseSplit = Map<String, int>.from(entry.warehouseSplit);
+      newWarehouseSplit[warehouseId] = (newWarehouseSplit[warehouseId] ?? 0) + delta;
+      if (newWarehouseSplit[warehouseId]! < 0) newWarehouseSplit[warehouseId] = 0;
+
+      final newSectionSplit = Map<String, Map<String, int>>.from(entry.sectionSplit);
+      final perWarehouse =
+          Map<String, int>.from(newSectionSplit[warehouseId] ?? const <String, int>{});
+      perWarehouse[sectionsKey] = (perWarehouse[sectionsKey] ?? 0) + delta;
+      if (perWarehouse[sectionsKey]! < 0) perWarehouse[sectionsKey] = 0;
+      newSectionSplit[warehouseId] = perWarehouse;
+
+      updated.add(
+        InventoryEntry(
+          item: {
+            ...entry.item,
+            if (meta != null && meta.isNotEmpty) 'meta': meta,
+          },
+          totalQty: newTotal,
+          warehouseSplit: newWarehouseSplit,
+          sectionSplit: newSectionSplit,
+        ),
+      );
+    }
+
+    if (!matched && delta > 0) {
+      updated.add(
+        InventoryEntry(
+          item: {
+            'id': itemId,
+            'name': itemName,
+            if (meta != null && meta.isNotEmpty) 'meta': meta,
+          },
+          totalQty: delta,
+          warehouseSplit: {warehouseId: delta},
+          sectionSplit: {
+            warehouseId: {sectionsKey: delta},
+          },
+        ),
+      );
+    }
+
+    setState(() {
+      _inventory = updated;
+      _recalculateLowStockItems(updated);
+    });
+    runDetached(_persistInventoryCache());
+  }
+
+  void _upsertWarehouseRecord(
+    Map<String, dynamic> record, {
+    String? replaceId,
+  }) {
+    final normalized = Map<String, dynamic>.from(record);
+    final sectionsRaw = normalized['sections'];
+    if (sectionsRaw is List) {
+      normalized['sections'] = sectionsRaw
+          .whereType<Map>()
+          .map((section) => Map<String, dynamic>.from(section))
+          .toList();
+    } else {
+      normalized['sections'] = <Map<String, dynamic>>[];
+    }
+    final actualId = normalized['id']?.toString();
+    bool replaced = false;
+    final updated = _warehouses.map((warehouse) {
+      final id = warehouse['id']?.toString();
+      if ((replaceId != null && id == replaceId) ||
+          (replaceId == null && actualId != null && id == actualId)) {
+        replaced = true;
+        final preservedSections =
+            (warehouse['sections'] as List?)?.whereType<Map>().map((section) {
+                  final copy = Map<String, dynamic>.from(section);
+                  if (actualId != null) {
+                    copy['warehouse_id'] = actualId;
+                  }
+                  return copy;
+                }).toList() ??
+                const <Map<String, dynamic>>[];
+        return {
+          ...normalized,
+          'sections': preservedSections.isNotEmpty
+              ? preservedSections
+              : normalized['sections'],
+        };
+      }
+      return warehouse;
+    }).toList();
+    if (!replaced) {
+      updated.add(normalized);
+    }
+    setState(() => _warehouses = updated);
+    runDetached(_persistWarehousesCache());
+  }
+
+  void _upsertSectionRecord(
+    Map<String, dynamic> record, {
+    String? replaceId,
+  }) {
+    final normalized = Map<String, dynamic>.from(record);
+    final actualId = normalized['id']?.toString();
+    final targetWarehouseId = normalized['warehouse_id']?.toString();
+    bool replaced = false;
+    final updated = _warehouses.map((warehouse) {
+      final sectionsRaw = warehouse['sections'];
+      if (sectionsRaw is! List) return warehouse;
+      var changed = false;
+      final sections = sectionsRaw.whereType<Map>().map((section) {
+        final sectionId = section['id']?.toString();
+        if (replaceId != null && sectionId == replaceId) {
+          replaced = true;
+          changed = true;
+          final next = Map<String, dynamic>.from(normalized);
+          next['warehouse_id'] =
+              next['warehouse_id']?.toString() ?? warehouse['id']?.toString();
+          return next;
+        }
+        if (replaceId == null && actualId != null && sectionId == actualId) {
+          replaced = true;
+          changed = true;
+          final next = Map<String, dynamic>.from(normalized);
+          next['warehouse_id'] =
+              next['warehouse_id']?.toString() ?? warehouse['id']?.toString();
+          return next;
+        }
+        return Map<String, dynamic>.from(section);
+      }).toList();
+      if (changed) {
+        return {...warehouse, 'sections': sections};
+      }
+      return warehouse;
+    }).toList();
+
+    List<Map<String, dynamic>> appendToWarehouse(
+        Map<String, dynamic> warehouse) {
+      final sectionsRaw = warehouse['sections'];
+      final sections = sectionsRaw is List
+          ? sectionsRaw
+              .whereType<Map>()
+              .map((section) => Map<String, dynamic>.from(section))
+              .toList()
+          : <Map<String, dynamic>>[];
+      final next = Map<String, dynamic>.from(normalized);
+      next['warehouse_id'] = warehouse['id']?.toString();
+      sections.add(next);
+      return sections;
+    }
+
+    if (!replaced && targetWarehouseId != null) {
+      final appended = updated.map((warehouse) {
+        if (warehouse['id']?.toString() == targetWarehouseId) {
+          return {
+            ...warehouse,
+            'sections': appendToWarehouse(warehouse),
+          };
+        }
+        return warehouse;
+      }).toList();
+      setState(() => _warehouses = appended);
+    } else {
+      setState(() => _warehouses = updated);
+    }
+    runDetached(_persistWarehousesCache());
   }
 
   Future<Map<String, dynamic>?> _updatePurchaseRequestLocally(
@@ -2666,7 +3916,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     return updated;
   }
 
-  void _showOfflineQueuedSnack([String message = 'Action enregistrée hors ligne.']) {
+  void _showOfflineQueuedSnack(
+      [String message = 'Action enregistrée hors ligne.']) {
     _showSnack(message);
   }
 
@@ -2676,7 +3927,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     setState(() => _pendingActionCount = actions.length);
   }
 
-  Future<CommandResult<Map<String, dynamic>>> _markPurchaseRequestToPlaceOffline(
+  Future<CommandResult<Map<String, dynamic>>>
+      _markPurchaseRequestToPlaceOffline(
     Map<String, dynamic> request,
     int qty,
   ) async {
@@ -2723,6 +3975,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     String? warehouseId,
     String? sectionId,
     String? note,
+    String? itemId,
   }) async {
     final tempId = 'local_${DateTime.now().microsecondsSinceEpoch}';
     Map<String, dynamic>? warehouse;
@@ -2741,6 +3994,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       'qty': qty,
       'status': 'pending',
       'note': note,
+      if (itemId != null && itemId.isNotEmpty) 'item_id': itemId,
       'warehouse_id': warehouseId,
       'section_id': sectionId,
       'created_at': DateTime.now().toIso8601String(),
@@ -2759,6 +4013,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         'warehouse_id': warehouseId,
         'section_id': sectionId,
         'note': note,
+        if (itemId != null && itemId.isNotEmpty) 'item_id': itemId,
       },
     );
     await _refreshPendingActionsCount();
@@ -2827,7 +4082,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     });
 
     if (!result.ok) {
-      if (!_isOnline) {
+      if (!_isOnline || _isNetworkError(result.error)) {
         await queueOfflineUpdate();
         return;
       }
@@ -2866,6 +4121,258 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         'qty': updated['qty'] ?? newQty,
         'delta': delta,
         'request_id': requestId,
+      },
+    );
+  }
+
+  Future<void> _handleEditPurchaseRequest(Map<String, dynamic> request) async {
+    final requestId = _purchaseRequestId(request);
+    if (requestId == null) return;
+    final initialNote = request['note']?.toString() ?? '';
+    final itemId = request['item_id']?.toString() ??
+        _matchInventoryItemByName(request['name']?.toString());
+    final itemMeta = itemId == null
+        ? const <String, dynamic>{}
+        : Map<String, dynamic>.from(
+            _inventory
+                    .firstWhere(
+                      (e) => e.item['id']?.toString() == itemId,
+                      orElse: () => const InventoryEntry(item: {}),
+                    )
+                    .item['meta'] as Map? ??
+                const {},
+          );
+    String? photoUrl = itemMeta['photo_url']?.toString();
+    final noteCtrl = TextEditingController(text: initialNote);
+    bool submitting = false;
+    String? dialogError;
+    bool uploadingPhoto = false;
+    bool photoChanged = false;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            Widget preview() {
+              if (photoUrl == null || photoUrl!.isEmpty) {
+                return Container(
+                  height: 140,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Text('Aucune photo'),
+                );
+              }
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  photoUrl!,
+                  height: 200,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                    height: 140,
+                    color: Colors.grey.shade200,
+                    alignment: Alignment.center,
+                    child: const Text('Photo non disponible'),
+                  ),
+                ),
+              );
+            }
+
+            Future<void> pickPhoto(ImageSource source) async {
+              if (!_isOnline) {
+                _showSnack('Ajoute la photo en ligne pour l’envoyer.', error: true);
+                return;
+              }
+              if (itemId == null) {
+                _showSnack('Crée d’abord la pièce pour ajouter une photo.', error: true);
+                return;
+              }
+              final picker = ImagePicker();
+              final picked = await picker.pickImage(
+                source: source,
+                imageQuality: 80,
+                maxWidth: 1600,
+              );
+              if (picked == null) return;
+              setSheetState(() {
+                uploadingPhoto = true;
+                dialogError = null;
+              });
+              try {
+                final uploadedUrl = await _uploadPhotoFromPath(picked.path);
+                setSheetState(() {
+                  photoUrl = uploadedUrl;
+                  photoChanged = true;
+                });
+              } catch (e) {
+                setSheetState(() {
+                  dialogError = e.toString();
+                });
+              } finally {
+                setSheetState(() => uploadingPhoto = false);
+              }
+            }
+
+            Future<void> submit() async {
+              setSheetState(() {
+                submitting = true;
+                dialogError = null;
+              });
+              final note = noteCtrl.text.trim();
+              final patch = <String, dynamic>{
+                'note': note,
+              };
+
+              if (!_isOnline) {
+                final updated =
+                    await _updatePurchaseRequestLocally(requestId, patch);
+                await OfflineActionsService.instance.enqueue(
+                  OfflineActionTypes.purchaseRequestUpdate,
+                  {
+                    'request_id': requestId,
+                    'patch': patch,
+                    'log': {
+                      'event': 'purchase_request_note_updated',
+                      'note': note,
+                      'payload': {
+                        'request_id': requestId,
+                        'note': note,
+                      },
+                    },
+                  },
+                );
+                await _refreshPendingActionsCount();
+                if (!mounted || !context.mounted) return;
+                Navigator.of(context).pop(updated);
+                _showOfflineQueuedSnack('Commande mise à jour (hors ligne).');
+                return;
+              }
+
+              final result = await _commands.updatePurchaseRequest(
+                requestId: requestId,
+                patch: patch,
+              );
+              if (!mounted || !context.mounted) return;
+              if (!result.ok || result.data == null) {
+                setSheetState(() {
+                  submitting = false;
+                  dialogError =
+                      _describeError(result.error) ?? 'Impossible de modifier.';
+                });
+                return;
+              }
+              _replacePurchaseRequest(result.data!);
+
+              if (photoChanged && photoUrl != null && itemId != null) {
+                final meta = Map<String, dynamic>.from(
+                    itemMeta.isEmpty ? <String, dynamic>{} : itemMeta);
+                meta['photo_url'] = photoUrl!;
+                await _persistItemMeta(
+                  itemId: itemId,
+                  meta: meta,
+                  successMessage: null,
+                );
+              }
+              if (!mounted || !context.mounted) return;
+              Navigator.of(context).pop();
+              _showSnack('Commande mise à jour.');
+            }
+
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Text(
+                        'Détails de la commande',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        onPressed: submitting ? null : () => Navigator.pop(context),
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ),
+                const SizedBox(height: 12),
+                preview(),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: uploadingPhoto
+                            ? null
+                            : () => pickPhoto(ImageSource.camera),
+                        icon: const Icon(Icons.photo_camera),
+                        label: const Text('Prendre une photo'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: uploadingPhoto
+                            ? null
+                            : () => pickPhoto(ImageSource.gallery),
+                        icon: const Icon(Icons.photo_library_outlined),
+                        label: const Text('Photothèque'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: noteCtrl,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                      labelText: 'Note (optionnel)',
+                      hintText: 'Ajoute un commentaire',
+                    ),
+                  ),
+                  if (dialogError != null) ...[
+                    const SizedBox(height: 8),
+                    Text(dialogError!, style: const TextStyle(color: Colors.red)),
+                  ],
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      TextButton(
+                        onPressed:
+                            submitting ? null : () => Navigator.of(context).pop(),
+                        child: const Text('Annuler'),
+                      ),
+                      const Spacer(),
+                      FilledButton(
+                        onPressed: submitting ? null : submit,
+                        child: submitting
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Text('Enregistrer'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        );
       },
     );
   }
@@ -2950,52 +4457,76 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     }
 
     var sectionId = _extractSectionId(request);
-    if (warehouseId != null) {
-      final sections = _sectionsForWarehouse(warehouseId);
-      final hasExistingSection = sectionId != null &&
-          sections.any((section) => section['id']?.toString() == sectionId);
-      if (!hasExistingSection) {
-        sectionId = null;
-      }
-      if (sections.isNotEmpty && sectionId == null) {
-        final selection = await _promptSectionSelection(
-          warehouseId: warehouseId,
-        );
-        if (selection.cancelled) {
-          return;
-        }
-        sectionId = selection.sectionId;
-      }
-      _applySectionToRequest(request, warehouseId, sectionId);
+    final sections = _sectionsForWarehouse(warehouseId);
+    final hasExistingSection = sectionId != null &&
+        sections.any((section) => section['id']?.toString() == sectionId);
+    if (!hasExistingSection) {
+      sectionId = null;
     }
-
-    if (warehouseId == null) {
-      _showSnack('Sélectionne un entrepôt pour placer cette pièce.',
-          error: true);
-      return;
+    if (sections.isNotEmpty && sectionId == null) {
+      final selection = await _promptSectionSelection(
+        warehouseId: warehouseId,
+      );
+      if (selection.cancelled) {
+        return;
+      }
+      sectionId = selection.sectionId;
     }
+    _applySectionToRequest(request, warehouseId, sectionId);
 
     var itemId = request['item_id']?.toString();
     itemId ??= _matchInventoryItemByName(request['name']?.toString());
     if (itemId == null) {
-      final createResult = await _commands.createItem(
-        companyId: companyId,
-        name: request['name']?.toString() ?? 'Pièce',
-      );
-      if (!createResult.ok) {
-        _showSnack(
-          _describeError(createResult.error) ??
-              'Impossible de créer l’article pour cette pièce.',
-          error: true,
+      final itemName = request['name']?.toString() ?? 'Pièce';
+      if (_isOnline) {
+        final createResult = await _commands.createItem(
+          companyId: companyId,
+          name: itemName,
         );
-        return;
-      }
-      itemId = createResult.data?['id']?.toString();
-      if (itemId == null) {
-        _showSnack('Article créé mais identifiant manquant.', error: true);
-        return;
+        if (!createResult.ok) {
+          _showSnack(
+            _describeError(createResult.error) ??
+                'Impossible de créer l’article pour cette pièce.',
+            error: true,
+          );
+          return;
+        }
+        itemId = createResult.data?['id']?.toString();
+        if (itemId == null) {
+          _showSnack('Article créé mais identifiant manquant.', error: true);
+          return;
+        }
+      } else {
+        final entry = await _createInventoryItemOffline(
+          companyId: companyId,
+          name: itemName,
+        );
+        itemId = entry?.item['id']?.toString();
+        if (itemId == null) {
+          _showSnack(
+            'Impossible de créer l’article hors ligne pour cette pièce.',
+            error: true,
+          );
+          return;
+        }
       }
       request['item_id'] = itemId;
+    }
+
+    if (!_isOnline) {
+      final placed = await _placePurchaseRequestOffline(
+        request: request,
+        requestId: requestId,
+        companyId: companyId,
+        itemId: itemId,
+        warehouseId: warehouseId,
+        sectionId: sectionId,
+        qty: qty,
+      );
+      if (placed) {
+        _applySectionToRequest(request, warehouseId, sectionId);
+      }
+      return;
     }
 
     setState(() {
@@ -3025,6 +4556,18 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
     if (!stockResult.ok) {
       await clearUpdating();
+      if (_isNetworkError(stockResult.error)) {
+        final placedOffline = await _placePurchaseRequestOffline(
+          request: request,
+          requestId: requestId,
+          companyId: companyId,
+          itemId: itemId,
+          warehouseId: warehouseId,
+          sectionId: sectionId,
+          qty: qty,
+        );
+        if (placedOffline) return;
+      }
       _showSnack(
         _describeError(stockResult.error) ??
             'Impossible d’ajouter cette pièce en stock.',
@@ -3054,6 +4597,18 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         sectionId: sectionId,
       );
       await clearUpdating();
+      if (_isNetworkError(updateResult.error)) {
+        await _placePurchaseRequestOffline(
+          request: request,
+          requestId: requestId,
+          companyId: companyId,
+          itemId: itemId,
+          warehouseId: warehouseId,
+          sectionId: sectionId,
+          qty: qty,
+        );
+        return;
+      }
       _showSnack(
         _describeError(updateResult.error) ??
             'Stock ajouté mais impossible de mettre à jour la demande.',
@@ -3131,17 +4686,48 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
           warehouseProvider: warehouseProvider,
           warehousesProvider: () => _warehouses,
           inventoryProvider: () => _inventory,
+          equipmentProvider: () => _equipment,
           commands: _commands,
           describeError: _describeError,
           onRefresh: _refreshAll,
           isOnline: () => _isOnline,
           initialSectionId: sectionId,
-          onShowJournal: ({String? scopeOverride, String? entityId}) =>
+          onShowJournal: ({
+            String? scopeOverride,
+            String? entityId,
+            bool prefix = false,
+          }) =>
               _handleOpenJournal(
             scopeOverride: scopeOverride ?? 'inventory',
             entityId: entityId,
+            prefix: prefix,
           ),
           onManageWarehouse: _handleManageWarehouse,
+          onCreateSectionOffline: ({
+            required String warehouseId,
+            required String name,
+            String? code,
+          }) =>
+              _createInventorySectionOffline(
+            companyId: companyId,
+            warehouseId: warehouseId,
+            name: name,
+            code: code,
+          ),
+          onCreateItemOffline: ({
+            required String name,
+            String? sku,
+            String? unit,
+            String? category,
+          }) =>
+              _createInventoryItemOffline(
+            companyId: companyId,
+            name: name,
+            sku: sku,
+            unit: unit,
+            category: category,
+          ),
+          onReplaceEquipment: _replaceEquipment,
         ),
       ),
     );
@@ -3272,7 +4858,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (sections.isEmpty) {
       return (cancelled: false, sectionId: null);
     }
-    final sentinel = InventoryEntry.unassignedSectionKey;
+    const sentinel = InventoryEntry.unassignedSectionKey;
     var selectedValue = initialSectionId;
     final hasInitial = selectedValue != null &&
         sections.any((section) => section['id']?.toString() == selectedValue);
@@ -3293,8 +4879,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                   children: [
                     for (final section in sections)
                       RadioListTile<String>(
+                        // ignore: deprecated_member_use
                         value: section['id']?.toString() ?? '',
+                        // ignore: deprecated_member_use
                         groupValue: selectedValue,
+                        // ignore: deprecated_member_use
                         onChanged: (value) {
                           if (value == null) return;
                           setDialogState(() => selectedValue = value);
@@ -3303,8 +4892,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                             section['name']?.toString() ?? 'Section sans nom'),
                       ),
                     RadioListTile<String>(
+                      // ignore: deprecated_member_use
                       value: sentinel,
+                      // ignore: deprecated_member_use
                       groupValue: selectedValue,
+                      // ignore: deprecated_member_use
                       onChanged: (value) {
                         if (value == null) return;
                         setDialogState(() => selectedValue = value);
@@ -3427,7 +5019,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
               ListTile(
                 leading: const Icon(Icons.qr_code_2),
                 title: const Text('Créer un code de connexion'),
-                subtitle: const Text('Code partagé pour rejoindre l’entreprise.'),
+                subtitle:
+                    const Text('Code partagé pour rejoindre l’entreprise.'),
                 onTap: () => Navigator.of(context).pop(_InviteOption.joinCode),
               ),
             ],
@@ -3570,6 +5163,398 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
 
     emailCtrl.dispose();
     noteCtrl.dispose();
+  }
+
+  Future<void> _handleChangeMemberRole(
+    Map<String, dynamic> member,
+  ) async {
+    final companyId = _overview?.membership?.companyId;
+    if (companyId == null) {
+      _showSnack('Entreprise inconnue.', error: true);
+      return;
+    }
+    final userUid = member['user_uid']?.toString();
+    if (userUid == null || userUid.isEmpty) {
+      _showSnack('Membre invalide.', error: true);
+      return;
+    }
+
+    final actingRole = companyRoleFromString(_overview?.membership?.role);
+    final assignableRoles = actingRole.assignableRoles;
+    if (assignableRoles.isEmpty) {
+      _showSnack(
+        'Tu n’as pas la permission de modifier les rôles.',
+        error: true,
+      );
+      return;
+    }
+
+    final memberName = _memberDisplayName(member);
+    final currentRole = companyRoleFromString(member['role']?.toString());
+    CompanyRole selectedRole = assignableRoles.contains(currentRole)
+        ? currentRole
+        : assignableRoles.first;
+
+    final newRole = await showDialog<CompanyRole>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Changer le rôle'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    memberName,
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<CompanyRole>(
+                    initialValue: selectedRole,
+                    decoration:
+                        const InputDecoration(labelText: 'Nouveau rôle'),
+                    items: assignableRoles
+                        .map(
+                          (role) => DropdownMenuItem<CompanyRole>(
+                            value: role,
+                            child: Text(role.label),
+                          ),
+                        )
+                        .toList(growable: false),
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setDialogState(() => selectedRole = value);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Les rôles contrôlent l’accès aux modules Logtek.',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: Colors.black54),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(null),
+                  child: const Text('Annuler'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop(selectedRole),
+                  child: const Text('Enregistrer'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (newRole == null || newRole == currentRole) {
+      return;
+    }
+
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    final result = await _commands.updateMembershipRole(
+      companyId: companyId,
+      userUid: userUid,
+      role: newRole.value,
+    );
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop();
+
+    if (!result.ok) {
+      _showSnack(
+        _describeError(result.error) ?? 'Modification impossible.',
+        error: true,
+      );
+      return;
+    }
+
+    _showSnack('Rôle mis à jour.');
+    await _refreshAll();
+  }
+
+  Future<void> _handleRemoveMember(Map<String, dynamic> member) async {
+    final companyId = _overview?.membership?.companyId;
+    if (companyId == null) {
+      _showSnack('Entreprise inconnue.', error: true);
+      return;
+    }
+    final userUid = member['user_uid']?.toString();
+    if (userUid == null || userUid.isEmpty) {
+      _showSnack('Membre invalide.', error: true);
+      return;
+    }
+    final memberName = _memberDisplayName(member);
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Retirer ce membre ?'),
+        content: Text(
+          '“$memberName” perdra immédiatement l’accès à l’entreprise.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Retirer'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true || !mounted) return;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    final result = await _commands.removeMembership(
+      companyId: companyId,
+      userUid: userUid,
+    );
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop();
+
+    if (!result.ok) {
+      _showSnack(
+        _describeError(result.error) ?? 'Suppression impossible.',
+        error: true,
+      );
+      return;
+    }
+
+    _showSnack('Membre retiré.');
+    await _refreshAll();
+  }
+
+  Future<void> _handleAssignEquipmentToMember(
+    Map<String, dynamic> member,
+  ) async {
+    if (_equipment.isEmpty) {
+      _showSnack('Aucun équipement disponible.', error: true);
+      return;
+    }
+    final userUid = member['user_uid']?.toString();
+    if (userUid == null || userUid.isEmpty) {
+      _showSnack('Membre invalide.', error: true);
+      return;
+    }
+
+    final memberName = _memberDisplayName(member);
+    final equipmentList = _equipment.toList()
+      ..sort(
+        (a, b) => (a['name']?.toString() ?? '')
+            .toLowerCase()
+            .compareTo((b['name']?.toString() ?? '').toLowerCase()),
+      );
+    final currentSelection = equipmentList
+        .where((item) => _equipmentAssignedUserId(item) == userUid)
+        .map((item) => item['id']?.toString())
+        .whereType<String>()
+        .toSet();
+
+    final selected = await showDialog<Set<String>>(
+      context: context,
+      builder: (context) {
+        final workingSelection = <String>{...currentSelection};
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Attribuer un équipement'),
+              content: SizedBox(
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Sélectionne les équipements liés à $memberName.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodyMedium
+                            ?.copyWith(color: Colors.black54),
+                      ),
+                      const SizedBox(height: 12),
+                      for (final item in equipmentList)
+                        Builder(
+                          builder: (context) {
+                            final equipmentId = item['id']?.toString();
+                            if (equipmentId == null) {
+                              return const SizedBox.shrink();
+                            }
+                            final assignedUid = _equipmentAssignedUserId(item);
+                            final otherName = assignedUid == null
+                                ? ''
+                                : _memberNameByUid(assignedUid);
+                            final assignedNameLabel =
+                                assignedUid == null || assignedUid == userUid
+                                    ? null
+                                    : otherName.isNotEmpty
+                                        ? otherName
+                                        : _equipmentAssignedName(item);
+                            final checked =
+                                workingSelection.contains(equipmentId);
+                            final subtitle = assignedUid == null
+                                ? null
+                                : assignedUid == userUid
+                                    ? 'Attribué à $memberName'
+                                    : 'Actuellement : ${assignedNameLabel ?? 'autre membre'}';
+                            return CheckboxListTile(
+                              value: checked,
+                              controlAffinity: ListTileControlAffinity.leading,
+                              onChanged: (value) {
+                                if (value == null) return;
+                                setDialogState(() {
+                                  if (value) {
+                                    workingSelection.add(equipmentId);
+                                  } else {
+                                    workingSelection.remove(equipmentId);
+                                  }
+                                });
+                              },
+                              title: Text(
+                                  item['name']?.toString() ?? 'Équipement'),
+                              subtitle:
+                                  subtitle == null ? null : Text(subtitle),
+                            );
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(null),
+                  child: const Text('Annuler'),
+                ),
+                FilledButton(
+                  onPressed: () =>
+                      Navigator.of(context).pop(workingSelection.toSet()),
+                  child: const Text('Enregistrer'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (selected == null) return;
+
+    final updates = <({Map<String, dynamic> equipment, String? assignedTo})>[];
+    for (final item in equipmentList) {
+      final equipmentId = item['id']?.toString();
+      if (equipmentId == null) continue;
+      final assignedUid = _equipmentAssignedUserId(item);
+      final shouldAssign = selected.contains(equipmentId);
+      if (shouldAssign && assignedUid != userUid) {
+        updates.add((equipment: item, assignedTo: userUid));
+      } else if (!shouldAssign && assignedUid == userUid) {
+        updates.add((equipment: item, assignedTo: null));
+      }
+    }
+
+    if (updates.isEmpty) {
+      _showSnack('Aucune modification apportée.');
+      return;
+    }
+
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    var queuedOffline = false;
+    String? failureMessage;
+    for (final update in updates) {
+      final nextMeta = Map<String, dynamic>.from(
+          update.equipment['meta'] as Map? ?? const <String, dynamic>{});
+      if (update.assignedTo == null) {
+        nextMeta.remove(_equipmentAssignedToKey);
+        nextMeta.remove(_equipmentAssignedNameKey);
+        nextMeta.remove(_equipmentAssignedAtKey);
+      } else {
+        nextMeta[_equipmentAssignedToKey] = update.assignedTo;
+        nextMeta[_equipmentAssignedNameKey] = memberName;
+        nextMeta[_equipmentAssignedAtKey] = DateTime.now().toIso8601String();
+      }
+      final equipmentName =
+          update.equipment['name']?.toString() ?? 'Équipement';
+      final events = <Map<String, dynamic>>[
+        {
+          'event': update.assignedTo == null
+              ? 'equipment_unassigned'
+              : 'equipment_assigned',
+          'category': 'general',
+          'note': update.assignedTo == null
+              ? '$equipmentName retiré de $memberName'
+              : '$equipmentName attribué à $memberName',
+          'payload': {
+            'equipment_id': update.equipment['id']?.toString(),
+            'assigned_to': update.assignedTo,
+            if (update.assignedTo != null) 'assigned_name': memberName,
+          },
+        },
+      ];
+      final outcome = await _persistEquipmentMetaUpdate(
+        equipment: update.equipment,
+        nextMeta: nextMeta,
+        events: events,
+        successMessage: '',
+        offlineMessage: 'Assignation enregistrée (hors ligne).',
+        errorFallbackMessage: 'Impossible de mettre à jour l’équipement.',
+        showSuccessSnack: false,
+        showOfflineSnack: false,
+        refreshOnSuccess: false,
+      );
+      if (!outcome.ok) {
+        failureMessage = outcome.message;
+        break;
+      }
+      queuedOffline = queuedOffline || outcome.queuedOffline;
+    }
+
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop();
+
+    if (failureMessage != null) {
+      _showSnack(failureMessage, error: true);
+      return;
+    }
+
+    if (queuedOffline) {
+      _showOfflineQueuedSnack('Assignations enregistrées (hors ligne).');
+    } else {
+      _showSnack('Assignations mises à jour.');
+    }
+
+    if (_isOnline) {
+      await _refreshAll();
+    } else {
+      setState(() {});
+    }
   }
 
   Future<void> _promptCreateJoinCode() async {
@@ -3724,7 +5709,10 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                           if (value == null || value.trim().isEmpty) {
                             return 'Code requis';
                           }
-                          if (value.trim().replaceAll(RegExp(r'\s+'), '').length <
+                          if (value
+                                  .trim()
+                                  .replaceAll(RegExp(r'\s+'), '')
+                                  .length <
                               4) {
                             return 'Au moins 4 caractères';
                           }
@@ -3740,7 +5728,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                       ),
                       const SizedBox(height: 12),
                       DropdownButtonFormField<String>(
-                        value: selectedRole,
+                        initialValue: selectedRole,
                         decoration:
                             const InputDecoration(labelText: 'Rôle attribué'),
                         items: roles
@@ -3780,7 +5768,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                               tooltip: 'Effacer',
                               onPressed: expiresAt == null
                                   ? null
-                                  : () => setDialogState(() => expiresAt = null),
+                                  : () =>
+                                      setDialogState(() => expiresAt = null),
                               icon: const Icon(Icons.clear),
                             ),
                             IconButton(
@@ -3862,6 +5851,20 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   }
 
   Future<void> _handleDeleteJoinCode(CompanyJoinCode code) async {
+    final codeId = code.id;
+    if (codeId.isEmpty) {
+      _showSnack('Code inconnu.', error: true);
+      return;
+    }
+
+    void removeLocally() {
+      if (!mounted) return;
+      setState(() {
+        _joinCodes =
+            _joinCodes.where((candidate) => candidate.id != codeId).toList();
+      });
+    }
+
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) {
@@ -3888,26 +5891,81 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     );
 
     if (confirm != true) return;
-    final result = await _commands.deleteJoinCode(codeId: code.id);
+
+    if (!_isOnline) {
+      _pendingJoinCodeDeletes.add(codeId);
+      removeLocally();
+      await OfflineActionsService.instance.enqueue(
+        OfflineActionTypes.joinCodeDelete,
+        {'code_id': codeId},
+      );
+      await _refreshPendingActionsCount();
+      _showOfflineQueuedSnack('Code supprimé (hors ligne).');
+      return;
+    }
+
+    _pendingJoinCodeDeletes.add(codeId);
+    removeLocally();
+    final result = await _commands.deleteJoinCode(codeId: codeId);
     if (!result.ok) {
+      _pendingJoinCodeDeletes.remove(codeId);
       _showSnack(
         _describeError(result.error) ?? 'Impossible de supprimer ce code.',
         error: true,
       );
+      await _refreshAll();
       return;
     }
     _showSnack('Code supprimé.');
-    if (mounted) {
-      setState(() {
-        _joinCodes =
-            _joinCodes.where((candidate) => candidate.id != code.id).toList();
-      });
-    }
     await _refreshAll();
+    _pendingJoinCodeDeletes.remove(codeId);
   }
 
   void _handleQuickAction(_QuickAction action) {
     runDetached(_launchQuickActionFlow(action));
+  }
+
+  void _handleShowLowStockPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => _LowStockPage(
+          items: _lowStockItems,
+          onOrder: (item) {
+            final name = item.item['name']?.toString();
+            String? warehouseId;
+            String? sectionId;
+
+            // Try to find where the item is stored
+            if (item.warehouseSplit.isNotEmpty) {
+              // Pick the first warehouse where it exists
+              warehouseId = item.warehouseSplit.keys.first;
+
+              // Try to find a section in this warehouse
+              final sections = item.sectionSplit[warehouseId];
+              if (sections != null && sections.isNotEmpty) {
+                // Pick the first section, ignoring unassigned if possible unless it's the only one
+                final sectionKeys = sections.keys
+                    .where((k) => k != InventoryEntry.unassignedSectionKey)
+                    .toList();
+                if (sectionKeys.isNotEmpty) {
+                  sectionId = sectionKeys.first;
+                } else if (sections
+                    .containsKey(InventoryEntry.unassignedSectionKey)) {
+                  // It's in unassigned
+                  sectionId = null;
+                }
+              }
+            }
+
+            _promptCreatePurchaseRequest(
+              initialName: name,
+              initialWarehouseId: warehouseId,
+              initialSectionId: sectionId,
+            );
+          },
+        ),
+      ),
+    );
   }
 
   Future<void> _launchQuickActionFlow(_QuickAction action) async {
@@ -3941,7 +5999,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   }
 
   Future<void> _handleQuickPickPiece() async {
-    final entry = await _copilotPromptInventoryItem(hint: 'pièce');
+    final entry = await _copilotPromptInventoryItem();
     if (entry == null) return;
     final warehouseId = await _copilotPromptWarehouse(entry);
     if (warehouseId == null) return;
@@ -4068,10 +6126,10 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     ).join();
   }
 
-  String _scopeForTab(_GateTab tab) {
+  String? _scopeForTab(_GateTab tab) {
     switch (tab) {
       case _GateTab.home:
-        return 'home';
+        return null;
       case _GateTab.list:
         return 'list';
       case _GateTab.inventory:
@@ -4083,7 +6141,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     }
   }
 
-  String _scopeLabel(String scope) {
+  String _scopeLabel(String? scope) {
+    if (scope == null) return 'Activité globale';
     switch (scope) {
       case 'home':
         return 'Accueil';
@@ -4164,12 +6223,20 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   }
 
   String _equipmentEntityId(String equipmentId, String? category) {
-    if (category == null ||
-        category.isEmpty ||
-        category == 'general') {
+    if (category == null || category.isEmpty || category == 'general') {
       return equipmentId;
     }
     return '$equipmentId::$category';
+  }
+
+  String _memberNameByUid(String userUid) {
+    final members = _overview?.members ?? const <Map<String, dynamic>>[];
+    final match = members.firstWhere(
+      (member) => member['user_uid']?.toString() == userUid,
+      orElse: () => const <String, dynamic>{},
+    );
+    if (match.isEmpty) return '';
+    return _memberDisplayName(match);
   }
 
   Future<void> _logJournal({
@@ -4188,6 +6255,61 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       event: event,
       note: note,
       payload: payload,
+    );
+  }
+
+  String _generateLocalId(String scope) {
+    final timestamp = DateTime.now().microsecondsSinceEpoch;
+    final salt = _random.nextInt(1 << 20);
+    return 'local_${scope}_${timestamp}_$salt';
+  }
+
+  /// Returns the current company id, falling back to cached overview if needed.
+  Future<String?> _resolveCompanyId() async {
+    final live = _overview?.membership?.companyId;
+    if (live != null) return live;
+    final cached = await _repository.readCachedCompanyOverview();
+    return cached?.membership?.companyId;
+  }
+
+  Future<String> _uploadPhotoFromPath(String path) async {
+    final file = File(path);
+    if (!await file.exists()) {
+      throw 'Fichier photo introuvable.';
+    }
+    final userId = Supa.i.auth.currentUser?.id ?? 'anon';
+    final ext = p.extension(path).replaceAll('.', '');
+    final fileName =
+        'requests/$userId/${DateTime.now().microsecondsSinceEpoch}.${ext.isEmpty ? 'jpg' : ext}';
+    final storage = Supa.i.storage.from('inventory-photos');
+    await storage.upload(fileName, file);
+    final publicUrl = storage.getPublicUrl(fileName);
+    return publicUrl;
+  }
+
+  String? _resolveOfflineId(String? rawId) {
+    if (rawId == null) return null;
+    return _offlineIdMapping[rawId] ?? rawId;
+  }
+
+  Future<String?> _resolveOfflineIdAsync(String? rawId) async {
+    final direct = _resolveOfflineId(rawId);
+    if (direct != null && direct != rawId) return direct;
+    if (rawId == null) return null;
+    final fromStorage = await OfflineStorage.instance.resolveIdMapping(rawId);
+    if (fromStorage != null) {
+      _offlineIdMapping[rawId] = fromStorage;
+      return fromStorage;
+    }
+    return direct;
+  }
+
+  void _rememberOfflineMapping(String? tempId, String? actualId) {
+    if (tempId == null || actualId == null) return;
+    _offlineIdMapping[tempId] = actualId;
+    // Persist so we can resolve after app restarts.
+    runDetached(
+      OfflineStorage.instance.saveIdMapping(tempId, actualId),
     );
   }
 
@@ -4218,8 +6340,44 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       _processQueuedInventoryDeleteItem,
     );
     OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.inventorySectionCreate,
+      _processQueuedInventorySectionCreate,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.inventorySectionUpdate,
+      _processQueuedInventorySectionUpdate,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.inventorySectionDelete,
+      _processQueuedInventorySectionDelete,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.inventoryItemCreate,
+      _processQueuedInventoryItemCreate,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.inventoryItemMetaUpdate,
+      _processQueuedInventoryItemMetaUpdate,
+    );
+    OfflineActionsService.instance.registerHandler(
       OfflineActionTypes.equipmentMetaUpdate,
       _processQueuedEquipmentMetaUpdate,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.equipmentDelete,
+      _processQueuedEquipmentDelete,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.joinCodeDelete,
+      _processQueuedJoinCodeDelete,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.warehouseCreate,
+      _processQueuedWarehouseCreate,
+    );
+    OfflineActionsService.instance.registerHandler(
+      OfflineActionTypes.equipmentCreate,
+      _processQueuedEquipmentCreate,
     );
     _offlineHandlersRegistered = true;
   }
@@ -4230,8 +6388,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         .registerHandler(OfflineActionTypes.purchaseRequestUpdate, null);
     OfflineActionsService.instance
         .registerHandler(OfflineActionTypes.purchaseRequestDelete, null);
-    OfflineActionsService.instance.registerHandler(
-        OfflineActionTypes.purchaseRequestMarkToPlace, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.purchaseRequestMarkToPlace, null);
     OfflineActionsService.instance
         .registerHandler(OfflineActionTypes.purchaseRequestCreate, null);
     OfflineActionsService.instance
@@ -4239,17 +6397,48 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     OfflineActionsService.instance
         .registerHandler(OfflineActionTypes.inventoryDeleteItem, null);
     OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.inventorySectionCreate, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.inventorySectionUpdate, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.inventorySectionDelete, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.inventoryItemCreate, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.inventoryItemMetaUpdate, null);
+    OfflineActionsService.instance
         .registerHandler(OfflineActionTypes.equipmentMetaUpdate, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.equipmentDelete, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.joinCodeDelete, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.warehouseCreate, null);
+    OfflineActionsService.instance
+        .registerHandler(OfflineActionTypes.equipmentCreate, null);
     _offlineHandlersRegistered = false;
   }
 
   Future<void> _processQueuedPurchaseRequestUpdate(
     Map<String, dynamic> payload,
   ) async {
-    final requestId = payload['request_id']?.toString();
+    final requestId =
+        await _resolveOfflineIdAsync(payload['request_id']?.toString());
     final patchRaw = payload['patch'];
     if (requestId == null || patchRaw is! Map) return;
     final patch = Map<String, dynamic>.from(patchRaw);
+    Future<void> resolvePatchId(String key) async {
+      final raw = patch[key];
+      if (raw == null) return;
+      final resolved = await _resolveOfflineIdAsync(raw.toString());
+      if (resolved != null) {
+        patch[key] = resolved;
+      }
+    }
+
+    await resolvePatchId('item_id');
+    await resolvePatchId('warehouse_id');
+    await resolvePatchId('section_id');
     final result = await _commands.updatePurchaseRequest(
       requestId: requestId,
       patch: patch,
@@ -4288,9 +6477,13 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (name == null || qty == null) {
       throw StateError('Payload invalide pour la demande hors ligne.');
     }
-    final warehouseId = payload['warehouse_id']?.toString();
-    final sectionId = payload['section_id']?.toString();
+    final warehouseId =
+        await _resolveOfflineIdAsync(payload['warehouse_id']?.toString());
+    final sectionId =
+        await _resolveOfflineIdAsync(payload['section_id']?.toString());
     final note = payload['note']?.toString();
+    final itemId =
+        await _resolveOfflineIdAsync(payload['item_id']?.toString());
     final result = await _commands.createPurchaseRequest(
       companyId: companyId,
       name: name,
@@ -4298,6 +6491,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       warehouseId: warehouseId,
       sectionId: sectionId,
       note: note,
+      itemId: itemId,
     );
     if (!result.ok || result.data == null) {
       throw result.error ?? 'Impossible de créer la demande.';
@@ -4307,14 +6501,16 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (tempId != null) {
       _removePurchaseRequest(tempId);
     }
+    final newId = result.data!['id']?.toString();
+    _rememberOfflineMapping(tempId, newId);
     _replacePurchaseRequest(result.data!);
     await _logJournal(
       scope: 'list',
       event: 'purchase_request_created',
-      entityId: result.data!['id']?.toString(),
+      entityId: newId,
       note: name,
       payload: {
-        'request_id': result.data!['id'],
+        'request_id': newId,
         'qty': qty,
         'warehouse_id': warehouseId,
         'section_id': sectionId,
@@ -4322,13 +6518,317 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     );
   }
 
+  Future<void> _processQueuedWarehouseCreate(
+    Map<String, dynamic> payload,
+  ) async {
+    final membership = _overview?.membership;
+    final companyId =
+        payload['company_id']?.toString() ?? membership?.companyId;
+    final name = payload['name']?.toString();
+    if (companyId == null || name == null) {
+      throw StateError('Payload invalide pour warehouse_create.');
+    }
+    final rawCode = payload['code']?.toString();
+    final code =
+        rawCode == null || rawCode.trim().isEmpty ? null : rawCode.trim();
+    final tempId = payload['temp_id']?.toString();
+    final result = await _commands.createWarehouse(
+      companyId: companyId,
+      name: name,
+      code: code,
+    );
+    if (!result.ok || result.data == null) {
+      throw result.error ?? 'Impossible de créer l’entrepôt.';
+    }
+    if (!mounted) return;
+    final newId = result.data!['id']?.toString();
+    _rememberOfflineMapping(tempId, newId);
+    _upsertWarehouseRecord(result.data!, replaceId: tempId);
+  }
+
+  Future<void> _processQueuedInventorySectionCreate(
+    Map<String, dynamic> payload,
+  ) async {
+    final membership = _overview?.membership;
+    final companyId =
+        payload['company_id']?.toString() ?? membership?.companyId;
+    final warehouseRaw = payload['warehouse_id']?.toString();
+    final name = payload['name']?.toString();
+    if (companyId == null || warehouseRaw == null || name == null) {
+      throw StateError('Payload invalide pour inventory_section_create.');
+    }
+    final warehouseId =
+        await _resolveOfflineIdAsync(warehouseRaw) ?? warehouseRaw;
+    final rawCode = payload['code']?.toString();
+    final code =
+        rawCode == null || rawCode.trim().isEmpty ? null : rawCode.trim();
+    final tempId = payload['temp_id']?.toString();
+    final result = await _commands.createInventorySection(
+      companyId: companyId,
+      warehouseId: warehouseId,
+      name: name,
+      code: code,
+    );
+    if (!result.ok || result.data == null) {
+      throw result.error ?? 'Impossible de créer la section.';
+    }
+    if (!mounted) return;
+    final section = result.data!;
+    final newId = section['id']?.toString();
+    _rememberOfflineMapping(tempId, newId);
+    _upsertSectionRecord(section, replaceId: tempId);
+    final resolvedWarehouseId =
+        section['warehouse_id']?.toString() ?? warehouseId;
+    await _logJournal(
+      scope: 'inventory',
+      event: 'section_created',
+      entityId: newId == null
+          ? _inventoryWarehouseEntityId(resolvedWarehouseId)
+          : _inventorySectionEntityId(resolvedWarehouseId, newId),
+      note: name,
+      payload: {
+        'warehouse_id': resolvedWarehouseId,
+        'section_id': newId,
+        if (code != null) 'code': code,
+      },
+    );
+  }
+
+  Future<void> _processQueuedInventoryItemCreate(
+    Map<String, dynamic> payload,
+  ) async {
+    final membership = _overview?.membership;
+    final companyId =
+        payload['company_id']?.toString() ?? membership?.companyId;
+    final name = payload['name']?.toString();
+    if (companyId == null || name == null) {
+      throw StateError('Payload invalide pour inventory_item_create.');
+    }
+
+    String? normalize(String? value) {
+      if (value == null) return null;
+      final trimmed = value.trim();
+      return trimmed.isEmpty ? null : trimmed;
+    }
+
+    final tempId = payload['temp_id']?.toString();
+    final result = await _commands.createItem(
+      companyId: companyId,
+      name: name,
+      sku: normalize(payload['sku']?.toString()),
+      unit: normalize(payload['unit']?.toString()),
+      category: normalize(payload['category']?.toString()),
+    );
+    if (!result.ok || result.data == null) {
+      throw result.error ?? 'Impossible de créer la pièce.';
+    }
+    if (!mounted) return;
+    final item = Map<String, dynamic>.from(result.data!);
+    final newId = item['id']?.toString();
+    _rememberOfflineMapping(tempId, newId);
+    setState(() {
+      var replaced = false;
+      final updated = _inventory.map((entry) {
+        final entryId = entry.item['id']?.toString();
+        if (tempId != null && entryId == tempId) {
+          replaced = true;
+          final mergedItem = {
+            ...entry.item,
+            ...item,
+          };
+          return InventoryEntry(
+            item: mergedItem,
+            totalQty: entry.totalQty,
+            warehouseSplit: entry.warehouseSplit,
+            sectionSplit: entry.sectionSplit,
+          );
+        }
+        return entry;
+      }).toList(growable: false);
+      if (replaced) {
+        _inventory = updated;
+      } else {
+        _inventory = [
+          ...updated,
+          InventoryEntry(
+            item: item,
+            totalQty: 0,
+            warehouseSplit: const <String, int>{},
+            sectionSplit: const <String, Map<String, int>>{},
+          ),
+        ];
+      }
+    });
+    runDetached(_persistInventoryCache());
+  }
+
+  Future<void> _processQueuedInventoryItemMetaUpdate(
+    Map<String, dynamic> payload,
+  ) async {
+    final itemId =
+        await _resolveOfflineIdAsync(payload['item_id']?.toString());
+    final metaPayload = payload['meta'];
+    if (itemId == null || metaPayload is! Map) {
+      throw StateError('Payload invalide pour inventory_item_meta_update.');
+    }
+    final meta = Map<String, dynamic>.from(metaPayload);
+    final result = await _commands.updateItemMeta(
+      itemId: itemId,
+      meta: meta,
+    );
+    if (!result.ok) {
+      throw result.error ?? 'Impossible de synchroniser la pièce.';
+    }
+    if (result.data == null || !mounted) return;
+    final newMeta = result.data!['meta'];
+    if (newMeta is Map) {
+      _applyLocalInventoryMeta(
+        itemId,
+        Map<String, dynamic>.from(newMeta),
+      );
+    }
+  }
+
+  Future<void> _processQueuedInventorySectionUpdate(
+    Map<String, dynamic> payload,
+  ) async {
+    final sectionId =
+        await _resolveOfflineIdAsync(payload['section_id']?.toString());
+    final patchRaw = payload['patch'];
+    if (sectionId == null || patchRaw is! Map) {
+      throw StateError('Payload invalide pour inventory_section_update.');
+    }
+    final patch = Map<String, dynamic>.from(patchRaw);
+    final result = await _commands.updateInventorySection(
+      sectionId: sectionId,
+      patch: patch,
+    );
+    if (!result.ok || result.data == null) {
+      throw result.error ?? 'Impossible de mettre à jour la section.';
+    }
+    if (!mounted) return;
+    _upsertSectionRecord(result.data!);
+  }
+
+  Future<void> _processQueuedInventorySectionDelete(
+    Map<String, dynamic> payload,
+  ) async {
+    final sectionId =
+        await _resolveOfflineIdAsync(payload['section_id']?.toString());
+    if (sectionId == null) {
+      throw StateError('Payload invalide pour inventory_section_delete.');
+    }
+    final result = await _commands.deleteInventorySection(sectionId: sectionId);
+    if (!result.ok) {
+      throw result.error ?? 'Impossible de supprimer la section.';
+    }
+    if (!mounted) return;
+    setState(() {
+      _warehouses = _warehouses.map((warehouse) {
+        final sections = warehouse['sections'];
+        if (sections is! List) return warehouse;
+        final filtered = sections
+            .whereType<Map>()
+            .where((section) => section['id']?.toString() != sectionId)
+            .toList();
+        if (filtered.length == sections.length) {
+          return warehouse;
+        }
+        return {...warehouse, 'sections': filtered};
+      }).toList();
+    });
+    runDetached(_persistWarehousesCache());
+  }
+
+  Future<void> _processQueuedEquipmentCreate(
+    Map<String, dynamic> payload,
+  ) async {
+    final membership = _overview?.membership;
+    final companyId =
+        payload['company_id']?.toString() ?? membership?.companyId;
+    final name = payload['name']?.toString();
+    if (companyId == null || name == null) {
+      throw StateError('Payload invalide pour equipment_create.');
+    }
+    String? normalize(String? value) {
+      if (value == null) return null;
+      final trimmed = value.trim();
+      return trimmed.isEmpty ? null : trimmed;
+    }
+
+    final tempId = payload['temp_id']?.toString();
+    final result = await _commands.createEquipment(
+      companyId: companyId,
+      name: name,
+      brand: normalize(payload['brand']?.toString()),
+      model: normalize(payload['model']?.toString()),
+      serial: normalize(payload['serial']?.toString()),
+    );
+    if (!result.ok || result.data == null) {
+      throw result.error ?? 'Impossible de créer l’équipement.';
+    }
+    if (!mounted) return;
+    final equipment = Map<String, dynamic>.from(result.data!);
+    final newId = equipment['id']?.toString();
+    _rememberOfflineMapping(tempId, newId);
+    setState(() {
+      var replaced = false;
+      _equipment = _equipment.map((item) {
+        if (tempId != null && item['id']?.toString() == tempId) {
+          replaced = true;
+          final next = Map<String, dynamic>.from(equipment);
+          final localMeta = item['meta'];
+          if (localMeta is Map && localMeta.isNotEmpty) {
+            next['meta'] = Map<String, dynamic>.from(localMeta);
+          }
+          return next;
+        }
+        return item;
+      }).toList();
+      if (!replaced) {
+        _equipment = [..._equipment, equipment];
+      }
+    });
+    await _persistEquipmentCache();
+    await _logJournal(
+      scope: 'equipment',
+      event: 'equipment_created',
+      entityId: equipment['id']?.toString(),
+      note: name,
+      payload: equipment,
+    );
+  }
+
+  Future<void> _processQueuedEquipmentDelete(
+    Map<String, dynamic> payload,
+  ) async {
+    final rawId = payload['equipment_id']?.toString();
+    final equipmentId = await _resolveOfflineIdAsync(rawId);
+    if (equipmentId == null) {
+      throw StateError('Payload invalide pour equipment_delete.');
+    }
+    final result = await _commands.deleteEquipment(equipmentId: equipmentId);
+    if (!result.ok) {
+      throw result.error ?? 'Impossible de supprimer cet équipement.';
+    }
+    if (!mounted) return;
+    _removeEquipment(equipmentId);
+    await _logJournal(
+      scope: 'equipment',
+      event: 'equipment_deleted',
+      entityId: equipmentId,
+      note: payload['equipment_name']?.toString(),
+      payload: {'equipment_id': equipmentId},
+    );
+  }
+
   Future<void> _processQueuedPurchaseRequestDelete(
     Map<String, dynamic> payload,
   ) async {
-    final requestId = payload['request_id']?.toString();
+    final requestId =
+        await _resolveOfflineIdAsync(payload['request_id']?.toString());
     if (requestId == null) return;
-    final result =
-        await _commands.deletePurchaseRequest(requestId: requestId);
+    final result = await _commands.deletePurchaseRequest(requestId: requestId);
     if (!result.ok) {
       throw result.error ?? 'Suppression impossible.';
     }
@@ -4346,7 +6846,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   Future<void> _processQueuedPurchaseRequestMarkToPlace(
     Map<String, dynamic> payload,
   ) async {
-    final requestId = payload['request_id']?.toString();
+    final requestId =
+        await _resolveOfflineIdAsync(payload['request_id']?.toString());
     final qty = payload['qty'];
     if (requestId == null || qty is! int) return;
     final patch = <String, dynamic>{
@@ -4384,8 +6885,10 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   ) async {
     final companyId =
         payload['company_id']?.toString() ?? _overview?.membership?.companyId;
-    final warehouseId = payload['warehouse_id']?.toString();
-    final itemId = payload['item_id']?.toString();
+    final warehouseId =
+        await _resolveOfflineIdAsync(payload['warehouse_id']?.toString());
+    final itemId =
+        await _resolveOfflineIdAsync(payload['item_id']?.toString());
     final delta = payload['delta'] is int
         ? payload['delta'] as int
         : int.tryParse(payload['delta']?.toString() ?? '');
@@ -4395,7 +6898,8 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     if (delta == null) {
       throw StateError('Delta manquant pour inventory_stock_delta.');
     }
-    final sectionId = payload['section_id']?.toString();
+    final sectionId =
+        await _resolveOfflineIdAsync(payload['section_id']?.toString());
     final note = payload['note']?.toString();
     final action = payload['action']?.toString() ?? 'manual';
     final metadata = payload['metadata'] is Map
@@ -4438,13 +6942,16 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   ) async {
     final companyId =
         payload['company_id']?.toString() ?? _overview?.membership?.companyId;
-    final itemId = payload['item_id']?.toString();
+    final itemId =
+        await _resolveOfflineIdAsync(payload['item_id']?.toString());
     if (companyId == null || itemId == null) {
       throw StateError('Payload invalide pour inventory_delete_item.');
     }
-    final sectionId = payload['section_id']?.toString();
+    final sectionId =
+        await _resolveOfflineIdAsync(payload['section_id']?.toString());
     final note = payload['note']?.toString();
-    final warehouseId = payload['warehouse_id']?.toString();
+    final warehouseId =
+        await _resolveOfflineIdAsync(payload['warehouse_id']?.toString());
     if (warehouseId == null) {
       throw StateError('Entrepôt manquant pour item_deleted.');
     }
@@ -4472,7 +6979,22 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
   Future<void> _processQueuedEquipmentMetaUpdate(
     Map<String, dynamic> payload,
   ) async {
-    final equipmentId = payload['equipment_id']?.toString();
+    final rawId = payload['equipment_id']?.toString();
+    var equipmentId = await _resolveOfflineIdAsync(rawId);
+    final equipmentName = payload['equipment_name']?.toString();
+    if (equipmentId == null && equipmentName != null) {
+      final match = _equipment.firstWhere(
+        (e) =>
+            (e['name']?.toString().toLowerCase() ?? '') ==
+            equipmentName.toLowerCase(),
+        orElse: () => const <String, dynamic>{},
+      );
+      final resolved = match['id']?.toString();
+      if (resolved != null && rawId != null) {
+        _rememberOfflineMapping(rawId, resolved);
+      }
+      equipmentId = resolved;
+    }
     final metaRaw = payload['meta'];
     if (equipmentId == null || metaRaw is! Map) {
       throw StateError('Payload invalide pour equipment_meta_update.');
@@ -4483,6 +7005,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
       meta: meta,
     );
     if (!result.ok || result.data == null) {
+      final message = result.error?.toString();
+      if (message != null && message.contains('introuvable')) {
+        // Équipement supprimé ou introuvable : on ignore pour ne pas bloquer la file.
+        return;
+      }
       throw result.error ?? 'Impossible de mettre à jour l’équipement.';
     }
     if (!mounted) return;
@@ -4506,6 +7033,25 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     }
   }
 
+  Future<void> _processQueuedJoinCodeDelete(
+    Map<String, dynamic> payload,
+  ) async {
+    final codeId = payload['code_id']?.toString();
+    if (codeId == null || codeId.isEmpty) {
+      throw StateError('Payload invalide pour join_code_delete.');
+    }
+    final result = await _commands.deleteJoinCode(codeId: codeId);
+    if (!result.ok) {
+      throw result.error ?? 'Impossible de supprimer le code.';
+    }
+    if (!mounted) return;
+    _pendingJoinCodeDeletes.remove(codeId);
+    setState(() {
+      _joinCodes =
+          _joinCodes.where((candidate) => candidate.id != codeId).toList();
+    });
+  }
+
   Future<void> _hydrateJournalEntries(
     List<Map<String, dynamic>> entries,
   ) async {
@@ -4519,20 +7065,18 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
         final remainder = entityId.substring(prefix.length);
         const sectionSeparator = '/section/';
         final hasSection = remainder.contains(sectionSeparator);
-        final warehouseId = hasSection
-            ? remainder.split(sectionSeparator).first
-            : remainder;
-        final sectionId = hasSection
-            ? remainder.split(sectionSeparator).last
-            : null;
+        final warehouseId =
+            hasSection ? remainder.split(sectionSeparator).first : remainder;
+        final sectionId =
+            hasSection ? remainder.split(sectionSeparator).last : null;
         final warehouseName = _warehouseNameById(warehouseId);
         if (sectionId != null) {
           if (sectionId == InventoryEntry.unassignedSectionKey) {
-            return 'Section sans affectation';
+            return '${warehouseName ?? "Entrepôt"} — Sans section';
           }
           final sectionName = _sectionNameById(warehouseId, sectionId);
           if (sectionName != null) {
-            return 'Section $sectionName';
+            return '${warehouseName ?? "Entrepôt"} — Section $sectionName';
           }
         }
         if (warehouseName != null) {
@@ -4559,8 +7103,11 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     return entityId;
   }
 
-  Future<void> _handleOpenJournal(
-      {String? scopeOverride, String? entityId}) async {
+  Future<void> _handleOpenJournal({
+    String? scopeOverride,
+    String? entityId,
+    bool prefix = false,
+  }) async {
     final membership = _overview?.membership;
     final companyId = membership?.companyId;
     if (companyId == null) {
@@ -4571,13 +7118,14 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     final scopeTitle = _scopeLabel(scope);
     final entitySuffix = entityId == null
         ? ''
-        : ' — ${_journalEntityLabel(scope, entityId) ?? entityId}';
+        : ' — ${_journalEntityLabel(scope ?? 'general', entityId) ?? entityId}';
     final title = 'Journal — $scopeTitle$entitySuffix';
 
     Future<List<Map<String, dynamic>>> loadEntries() async {
       final result = await _repository.fetchJournalEntries(
         scope: scope,
         entityId: entityId,
+        prefix: prefix,
       );
       if (result.hasMissingTables) {
         throw StateError('journal_entries');
@@ -4629,7 +7177,7 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
               setSheetState(() => submitting = true);
               await _commands.logJournalEntry(
                 companyId: companyId,
-                scope: scope,
+                scope: scope ?? 'home',
                 entityId: entityId,
                 event: 'note',
                 note: note,
@@ -4658,60 +7206,107 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
                         ?.copyWith(fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 16),
-                SizedBox(
-                  height: MediaQuery.of(context).size.height * 0.45,
-                  child: sheetError != null
-                      ? Center(
-                          child: Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: Text(
-                              sheetError!,
-                              textAlign: TextAlign.center,
+                  SizedBox(
+                    height: MediaQuery.of(context).size.height * 0.45,
+                    child: sheetError != null
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Text(
+                                sheetError!,
+                                textAlign: TextAlign.center,
+                              ),
                             ),
-                          ),
-                        )
-                      : entries.isEmpty
-                          ? const Center(child: Text('Aucun événement.'))
-                          : ListView.builder(
-                              itemCount: entries.length,
-                              itemBuilder: (_, index) {
-                                final entry = entries[index];
-                                final createdAt =
-                                    entry['created_at']?.toString();
-                                return ListTile(
-                                  contentPadding: EdgeInsets.zero,
-                                  leading: const Icon(Icons.event_note),
-                                  title: Text(
-                                    journalEventLabel(
-                                      entry['event']?.toString(),
+                          )
+                        : entries.isEmpty
+                            ? const Center(child: Text('Aucun événement.'))
+                            : ListView.builder(
+                                itemCount: entries.length,
+                                itemBuilder: (_, index) {
+                                  final entry = entries[index];
+                                  final createdAt =
+                                      entry['created_at']?.toString();
+                                  final entryEntityId =
+                                      entry['entity_id']?.toString();
+                                  final showEntity =
+                                      (entityId == null || prefix) &&
+                                          entryEntityId != null;
+                                  final event = entry['event']?.toString();
+                                  final entryScope =
+                                      entry['scope']?.toString() ??
+                                          scope ??
+                                          'general';
+                                  final payload = entry['payload'] as Map?;
+
+                                  String? extraInfo;
+                                  if (event == 'stock_delta' &&
+                                      payload != null) {
+                                    final itemName =
+                                        payload['item_name']?.toString();
+                                    final delta = payload['delta'];
+                                    final newQty = payload['new_qty'];
+                                    final parts = <String>[];
+                                    if (itemName != null) parts.add(itemName);
+                                    if (delta != null) {
+                                      final sign = (delta is num && delta > 0)
+                                          ? '+'
+                                          : '';
+                                      parts.add('$sign$delta');
+                                    }
+                                    if (newQty != null) {
+                                      parts.add('(Stock: $newQty)');
+                                    }
+                                    if (parts.isNotEmpty) {
+                                      extraInfo = parts.join(' • ');
+                                    }
+                                  }
+
+                                  return ListTile(
+                                    contentPadding: EdgeInsets.zero,
+                                    leading: const Icon(Icons.event_note),
+                                    title: Text(
+                                      journalEventLabel(event),
                                     ),
-                                  ),
-                                  subtitle: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      if (entry['note'] != null)
-                                        Text(entry['note'].toString()),
-                                      if (createdAt != null)
-                                        Text(
-                                          _formatDate(createdAt) ?? createdAt,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodySmall,
-                                        ),
-                                      if (entry['_author'] != null)
-                                        Text(
-                                          'Par ${entry['_author']}',
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodySmall,
-                                        ),
-                                    ],
-                                  ),
-                                );
-                              },
-                            ),
-                ),
+                                    subtitle: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        if (showEntity)
+                                          Text(
+                                            _journalEntityLabel(entryScope,
+                                                    entryEntityId) ??
+                                                entryEntityId,
+                                            style: const TextStyle(
+                                                fontWeight: FontWeight.w500),
+                                          ),
+                                        if (extraInfo != null)
+                                          Text(
+                                            extraInfo,
+                                            style: const TextStyle(
+                                                fontWeight: FontWeight.w600),
+                                          ),
+                                        if (entry['note'] != null)
+                                          Text(entry['note'].toString()),
+                                        if (createdAt != null)
+                                          Text(
+                                            _formatDate(createdAt) ?? createdAt,
+                                            style: Theme.of(context)
+                                                .textTheme
+                                                .bodySmall,
+                                          ),
+                                        if (entry['_author'] != null)
+                                          Text(
+                                            'Par ${entry['_author']}',
+                                            style: Theme.of(context)
+                                                .textTheme
+                                                .bodySmall,
+                                          ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                  ),
                   const SizedBox(height: 16),
                   TextField(
                     controller: noteCtrl,
@@ -4906,9 +7501,35 @@ class _CompanyGatePageState extends State<CompanyGatePage> {
     setState(() => _inlineMessage = null);
   }
 
+  Future<void> _handleSignOut() async {
+    final userId = Supa.i.auth.currentUser?.id;
+    if (userId != null) {
+      await OfflineStorage.instance.clearUserCache(userId);
+    }
+    await Supa.i.auth.signOut();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const SignInPage()),
+      (route) => false,
+    );
+  }
+
   String? _describeError(Object? error) {
     if (error == null) return null;
+    if (_isNetworkError(error)) return null;
     return error.toString();
+  }
+
+  bool _isNetworkError(Object? error) {
+    if (error == null) return false;
+    if (error is SocketException || error is HandshakeException) return true;
+    final message = error.toString().toLowerCase();
+    return message.contains('failed host lookup') ||
+        message.contains('socketexception') ||
+        message.contains('connection refused') ||
+        message.contains('connection reset') ||
+        message.contains('timed out') ||
+        message.contains('network is unreachable');
   }
 }
 
@@ -4917,14 +7538,20 @@ class _PurchaseRequestDialog extends StatefulWidget {
     required this.commands,
     required this.companyId,
     required this.warehouses,
+    required this.inventory,
     required this.describeError,
     required this.isOnline,
     this.onCreateOffline,
+    this.onCreateItemOffline,
+    this.initialName,
+    this.initialWarehouseId,
+    this.initialSectionId,
   });
 
   final CompanyCommands commands;
   final String companyId;
   final List<Map<String, dynamic>> warehouses;
+  final List<InventoryEntry> inventory;
   final String? Function(Object? error) describeError;
   final bool isOnline;
   final Future<Map<String, dynamic>?> Function({
@@ -4933,7 +7560,17 @@ class _PurchaseRequestDialog extends StatefulWidget {
     String? warehouseId,
     String? sectionId,
     String? note,
+    String? itemId,
   })? onCreateOffline;
+  final Future<InventoryEntry?> Function({
+    required String name,
+    String? sku,
+    String? unit,
+    String? category,
+  })? onCreateItemOffline;
+  final String? initialName;
+  final String? initialWarehouseId;
+  final String? initialSectionId;
 
   @override
   State<_PurchaseRequestDialog> createState() => _PurchaseRequestDialogState();
@@ -4943,6 +7580,7 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
   final _formKey = GlobalKey<FormState>();
   late final TextEditingController _nameCtrl;
   late final TextEditingController _noteCtrl;
+  late final FocusNode _nameFocusNode;
   String? _selectedWarehouseId;
   String? _selectedSectionId;
   int _qty = 1;
@@ -4952,14 +7590,18 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
   @override
   void initState() {
     super.initState();
-    _nameCtrl = TextEditingController();
+    _nameCtrl = TextEditingController(text: widget.initialName);
     _noteCtrl = TextEditingController();
+    _nameFocusNode = FocusNode();
+    _selectedWarehouseId = widget.initialWarehouseId;
+    _selectedSectionId = widget.initialSectionId;
   }
 
   @override
   void dispose() {
     _nameCtrl.dispose();
     _noteCtrl.dispose();
+    _nameFocusNode.dispose();
     super.dispose();
   }
 
@@ -4982,13 +7624,64 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
     });
 
     final bool online = ConnectivityService.instance.isOnline;
+    final trimmedName = _nameCtrl.text.trim();
+
+    Future<String?> ensureItemId() async {
+      // Try local match first.
+      final normalized = trimmedName.toLowerCase();
+      for (final entry in widget.inventory) {
+        final entryName = entry.item['name']?.toString();
+        final entryId = entry.item['id']?.toString();
+        if (entryName != null &&
+            entryId != null &&
+            entryName.trim().toLowerCase() == normalized) {
+          return entryId;
+        }
+      }
+      if (online) {
+        final itemResult = await widget.commands.createItem(
+          companyId: widget.companyId,
+          name: trimmedName,
+        );
+        if (!itemResult.ok || itemResult.data == null) {
+          setState(() {
+            _submitting = false;
+            _dialogError = widget.describeError(itemResult.error) ??
+                'Impossible de créer cette pièce.';
+          });
+          return null;
+        }
+        return itemResult.data!['id']?.toString();
+      }
+      if (widget.onCreateItemOffline != null) {
+        final created = await widget.onCreateItemOffline!(
+          name: trimmedName,
+          sku: null,
+          unit: null,
+          category: null,
+        );
+        return created?.item['id']?.toString();
+      }
+      setState(() {
+        _submitting = false;
+        _dialogError = 'Connexion requise pour créer cette pièce.';
+      });
+      return null;
+    }
+
+    final itemId = await ensureItemId();
+    if (itemId == null || itemId.isEmpty) {
+      return;
+    }
+
     if (!online && widget.onCreateOffline != null) {
       final offlineCreated = await widget.onCreateOffline!.call(
-        name: _nameCtrl.text.trim(),
+        name: trimmedName,
         qty: _qty,
         warehouseId: _selectedWarehouseId,
         sectionId: _selectedSectionId,
         note: _noteCtrl.text.trim(),
+        itemId: itemId,
       );
       if (!mounted) return;
       Navigator.of(context).pop(offlineCreated);
@@ -4997,11 +7690,12 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
 
     final result = await widget.commands.createPurchaseRequest(
       companyId: widget.companyId,
-      name: _nameCtrl.text.trim(),
+      name: trimmedName,
       qty: _qty,
       warehouseId: _selectedWarehouseId,
       sectionId: _selectedSectionId,
       note: _noteCtrl.text.trim(),
+      itemId: itemId,
     );
 
     if (!mounted) return;
@@ -5031,11 +7725,86 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextFormField(
-                controller: _nameCtrl,
-                decoration: const InputDecoration(labelText: 'Nom de la pièce'),
-                validator: (value) =>
-                    value == null || value.trim().isEmpty ? 'Nom requis' : null,
+              RawAutocomplete<_ItemSuggestion>(
+                textEditingController: _nameCtrl,
+                focusNode: _nameFocusNode,
+                displayStringForOption: (option) => option.name,
+                optionsBuilder: (textEditingValue) {
+                  final query = textEditingValue.text.trim().toLowerCase();
+                  if (query.isEmpty) {
+                    return const Iterable<_ItemSuggestion>.empty();
+                  }
+                  final matches = <_ItemSuggestion>[];
+                  final seen = <String>{};
+                  for (final entry in widget.inventory) {
+                    final name = entry.item['name']?.toString();
+                    if (name == null || name.isEmpty) continue;
+                    final normalizedName = name.toLowerCase();
+                    final sku = entry.item['sku']?.toString();
+                    final normalizedSku = sku?.toLowerCase();
+                    final matchesName = normalizedName.contains(query);
+                    final matchesSku =
+                        normalizedSku != null && normalizedSku.contains(query);
+                    if (!matchesName && !matchesSku) continue;
+                    if (seen.add(normalizedName)) {
+                      matches.add(_ItemSuggestion(name: name, sku: sku));
+                    }
+                    if (matches.length >= 8) break;
+                  }
+                  return matches;
+                },
+                fieldViewBuilder:
+                    (context, controller, focusNode, onFieldSubmitted) {
+                  return TextFormField(
+                    controller: controller,
+                    focusNode: focusNode,
+                    decoration: const InputDecoration(
+                      labelText: 'Nom de la pièce',
+                      helperText:
+                          'Tape le nom ou le SKU pour réutiliser une pièce existante.',
+                    ),
+                    validator: (value) => value == null || value.trim().isEmpty
+                        ? 'Nom requis'
+                        : null,
+                    textInputAction: TextInputAction.next,
+                  );
+                },
+                optionsViewBuilder: (context, onSelected, options) {
+                  return Align(
+                    alignment: Alignment.topLeft,
+                    child: Material(
+                      elevation: 4,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: 240,
+                          maxWidth: MediaQuery.of(context).size.width - 80,
+                        ),
+                        child: ListView.separated(
+                          padding: EdgeInsets.zero,
+                          itemBuilder: (context, index) {
+                            final option = options.elementAt(index);
+                            return ListTile(
+                              title: Text(option.name),
+                              subtitle: option.sku == null ||
+                                      option.sku!.trim().isEmpty
+                                  ? null
+                                  : Text('SKU ${option.sku}'),
+                              onTap: () => onSelected(option),
+                            );
+                          },
+                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemCount: options.length,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+                onSelected: (option) {
+                  _nameCtrl.text = option.name;
+                  _nameCtrl.selection = TextSelection.fromPosition(
+                    TextPosition(offset: option.name.length),
+                  );
+                },
               ),
               const SizedBox(height: 12),
               Row(
@@ -5173,6 +7942,12 @@ class _PurchaseRequestDialogState extends State<_PurchaseRequestDialog> {
   }
 }
 
+class _ItemSuggestion {
+  const _ItemSuggestion({required this.name, this.sku});
+  final String name;
+  final String? sku;
+}
+
 class _InventorySectionDialog extends StatefulWidget {
   const _InventorySectionDialog({
     required this.commands,
@@ -5180,6 +7955,8 @@ class _InventorySectionDialog extends StatefulWidget {
     required this.warehouseId,
     required this.warehouseName,
     required this.describeError,
+    required this.isOnline,
+    this.onCreateOffline,
   });
 
   final CompanyCommands commands;
@@ -5187,6 +7964,11 @@ class _InventorySectionDialog extends StatefulWidget {
   final String warehouseId;
   final String warehouseName;
   final String? Function(Object? error) describeError;
+  final bool isOnline;
+  final Future<Map<String, dynamic>?> Function({
+    required String name,
+    String? code,
+  })? onCreateOffline;
 
   @override
   State<_InventorySectionDialog> createState() =>
@@ -5220,6 +8002,23 @@ class _InventorySectionDialogState extends State<_InventorySectionDialog> {
       _submitting = true;
       _dialogError = null;
     });
+
+    if (!widget.isOnline && widget.onCreateOffline != null) {
+      final created = await widget.onCreateOffline!(
+        name: _nameCtrl.text.trim(),
+        code: _codeCtrl.text.trim().isEmpty ? null : _codeCtrl.text.trim(),
+      );
+      if (!mounted) return;
+      if (created == null) {
+        setState(() {
+          _submitting = false;
+          _dialogError = 'Action hors ligne impossible.';
+        });
+        return;
+      }
+      Navigator.of(context).pop(created);
+      return;
+    }
 
     final result = await widget.commands.createInventorySection(
       companyId: widget.companyId,
@@ -5297,37 +8096,6 @@ class _InventorySectionDialogState extends State<_InventorySectionDialog> {
               : const Text('Créer'),
         ),
       ],
-    );
-  }
-}
-
-class _InventoryBreakdownLine {
-  const _InventoryBreakdownLine({
-    required this.itemId,
-    required this.name,
-    this.sku,
-    required this.qty,
-    this.unit,
-  });
-
-  final String itemId;
-  final String name;
-  final String? sku;
-  final int qty;
-  final String? unit;
-
-  _InventoryBreakdownLine copyWith({
-    String? name,
-    String? sku,
-    int? qty,
-    String? unit,
-  }) {
-    return _InventoryBreakdownLine(
-      itemId: itemId,
-      name: name ?? this.name,
-      sku: sku ?? this.sku,
-      qty: qty ?? this.qty,
-      unit: unit ?? this.unit,
     );
   }
 }
@@ -5486,7 +8254,7 @@ class _HeaderBar extends StatelessWidget {
     required this.companyName,
     this.showCalendar = false,
     this.onShowJournal,
-     this.onShowCopilot,
+    this.onShowCopilot,
     this.statusIndicator,
   });
 
@@ -5613,7 +8381,6 @@ class _InlineMessage {
 
 class _InlineMessageBanner extends StatelessWidget {
   const _InlineMessageBanner({
-    super.key,
     required this.message,
     this.onClose,
   });
@@ -5642,7 +8409,7 @@ class _InlineMessageBanner extends StatelessWidget {
           ),
           child: Text(
             message.text,
-            style: TextStyle(
+            style: const TextStyle(
               color: foreground,
               fontWeight: FontWeight.w600,
             ),
@@ -5653,7 +8420,9 @@ class _InlineMessageBanner extends StatelessWidget {
   }
 }
 
-class _OnboardingView extends StatelessWidget {
+enum _OnboardingTab { company, more }
+
+class _OnboardingView extends StatefulWidget {
   const _OnboardingView({
     required this.creatingCompany,
     required this.joiningCompany,
@@ -5665,6 +8434,11 @@ class _OnboardingView extends StatelessWidget {
     required this.isOnline,
     required this.missingTables,
     required this.transientError,
+    this.userName,
+    this.userEmail,
+    this.onSignOut,
+    this.onDeleteAccount,
+    this.isDeletingAccount = false,
   });
 
   final bool creatingCompany;
@@ -5677,127 +8451,300 @@ class _OnboardingView extends StatelessWidget {
   final bool isOnline;
   final List<String> missingTables;
   final String? transientError;
+  final String? userName;
+  final String? userEmail;
+  final Future<void> Function()? onSignOut;
+  final Future<void> Function()? onDeleteAccount;
+  final bool isDeletingAccount;
+
+  @override
+  State<_OnboardingView> createState() => _OnboardingViewState();
+}
+
+class _OnboardingViewState extends State<_OnboardingView> {
+  _OnboardingTab _currentTab = _OnboardingTab.company;
 
   @override
   Widget build(BuildContext context) {
+    final banners = _buildBanners();
+    final content = _currentTab == _OnboardingTab.company
+        ? _buildCompanyContent(banners)
+        : _buildMoreContent(banners);
+
+    return Scaffold(
+      backgroundColor: AppColors.surface,
+      body: SafeArea(child: content),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _currentTab.index,
+        onDestinationSelected: (index) {
+          if (!mounted) return;
+          setState(() => _currentTab = _OnboardingTab.values[index]);
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.business_outlined),
+            selectedIcon: Icon(Icons.business),
+            label: 'Entreprise',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.more_horiz),
+            selectedIcon: Icon(Icons.more),
+            label: 'Plus',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCompanyContent(List<Widget> banners) {
+    return RefreshIndicator(
+      onRefresh: widget.onRefresh,
+      child: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          _buildHeader(),
+          if (banners.isNotEmpty) _buildBannerColumn(banners),
+          const SizedBox(height: 12),
+          _buildCreateCompanyCard(),
+          const SizedBox(height: 16),
+          _buildJoinCompanyCard(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMoreContent(List<Widget> banners) {
+    return RefreshIndicator(
+      onRefresh: widget.onRefresh,
+      child: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          _buildHeader(),
+          if (banners.isNotEmpty) _buildBannerColumn(banners),
+          const SizedBox(height: 12),
+          _OnboardingProfileCard(
+            userName: widget.userName,
+            userEmail: widget.userEmail,
+            onSignOut: widget.onSignOut,
+            onDeleteAccount: widget.onDeleteAccount,
+            isDeletingAccount: widget.isDeletingAccount,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Column(
+      children: [
+        Center(child: Image.asset('assets/images/logtek_logo.png', height: 64)),
+        const SizedBox(height: 24),
+        Text(
+          'Bienvenue chez Logtek G&I',
+          style: Theme.of(context).textTheme.headlineSmall,
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Crée une entreprise ou rejoins celle de ton équipe pour continuer.',
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 20),
+      ],
+    );
+  }
+
+  Widget _buildBannerColumn(List<Widget> banners) {
+    return Column(
+      children: [
+        for (final banner in banners) ...[
+          banner,
+          const SizedBox(height: 12),
+        ],
+      ],
+    );
+  }
+
+  List<Widget> _buildBanners() {
     final banners = <Widget>[];
-    if (!isOnline) {
+    if (!widget.isOnline) {
       banners.add(_StatusBanner.warning(
         icon: Icons.wifi_off,
         message: 'Connexion perdue. Certaines actions seront indisponibles.',
       ));
     }
-    if (missingTables.isNotEmpty) {
+    if (widget.missingTables.isNotEmpty) {
       banners.add(_StatusBanner.warning(
         icon: Icons.dataset_linked,
-        message: 'Tables manquantes : ${missingTables.join(', ')}',
+        message: 'Tables manquantes : ${widget.missingTables.join(', ')}',
       ));
     }
-    if (transientError != null) {
-      banners.add(_StatusBanner.error(transientError!));
+    if (widget.transientError != null) {
+      banners.add(_StatusBanner.error(widget.transientError!));
     }
+    return banners;
+  }
 
-    return Scaffold(
-      backgroundColor: AppColors.surface,
-      body: SafeArea(
-        child: RefreshIndicator(
-          onRefresh: onRefresh,
-          child: ListView(
-            padding: const EdgeInsets.all(24),
-            children: [
-              Center(
-                child: Image.asset('assets/images/logtek_logo.png', height: 64),
+  Widget _buildCreateCompanyCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Créer une entreprise',
+                style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 12),
+            TextField(
+              controller: widget.companyNameCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Nom de l’entreprise',
               ),
-              const SizedBox(height: 24),
-              Text(
-                'Bienvenue chez Logtek G&I',
-                style: Theme.of(context).textTheme.headlineSmall,
-                textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: widget.creatingCompany ? null : widget.onCreateCompany,
+              icon: widget.creatingCompany
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.factory),
+              label: const Text('Créer'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildJoinCompanyCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Rejoindre une entreprise',
+                style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 12),
+            TextField(
+              controller: widget.joinCodeCtrl,
+              textCapitalization: TextCapitalization.characters,
+              decoration: const InputDecoration(
+                labelText: 'Code d’accès',
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Crée une entreprise ou rejoins celle de ton équipe pour continuer.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              if (banners.isNotEmpty)
-                Column(
-                  children: [
-                    for (final banner in banners) ...[
-                      banner,
-                      const SizedBox(height: 12),
-                    ],
-                  ],
+            ),
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: widget.joiningCompany ? null : widget.onJoinCompany,
+              icon: widget.joiningCompany
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.login),
+              label: const Text('Rejoindre'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _OnboardingProfileCard extends StatelessWidget {
+  const _OnboardingProfileCard({
+    this.userName,
+    this.userEmail,
+    this.onSignOut,
+    this.onDeleteAccount,
+    this.isDeletingAccount = false,
+  });
+
+  final String? userName;
+  final String? userEmail;
+  final Future<void> Function()? onSignOut;
+  final Future<void> Function()? onDeleteAccount;
+  final bool isDeletingAccount;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final displayName = (userName != null && userName!.isNotEmpty)
+        ? userName!
+        : (userEmail ?? 'Utilisateur connecté');
+    final emailLabel = (userEmail != null && userEmail!.isNotEmpty)
+        ? userEmail!
+        : 'Email non disponible';
+    final trimmed = displayName.trim();
+    final initials =
+        trimmed.isNotEmpty ? trimmed.substring(0, 1).toUpperCase() : '?';
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Profil & session',
+                style: theme.textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w600,
+                )),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                CircleAvatar(
+                  child: Text(initials),
                 ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        displayName,
+                        style: theme.textTheme.titleMedium,
+                      ),
+                      Text(emailLabel, style: theme.textTheme.bodySmall),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Gère ton profil même avant de rejoindre une entreprise.',
+              style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
+            if (onSignOut != null)
+              FilledButton.tonalIcon(
+                onPressed: () => onSignOut?.call(),
+                icon: const Icon(Icons.logout),
+                label: const Text('Se déconnecter'),
+              ),
+            if (onSignOut != null && onDeleteAccount != null)
               const SizedBox(height: 12),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text('Créer une entreprise',
-                          style: Theme.of(context).textTheme.titleLarge),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: companyNameCtrl,
-                        decoration: const InputDecoration(
-                          labelText: 'Nom de l’entreprise',
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      FilledButton.icon(
-                        onPressed: creatingCompany ? null : onCreateCompany,
-                        icon: creatingCompany
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.factory),
-                        label: const Text('Créer'),
-                      ),
-                    ],
-                  ),
+            if (onDeleteAccount != null)
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red.shade50,
+                  foregroundColor: Colors.red.shade800,
                 ),
+                onPressed:
+                    isDeletingAccount ? null : () => onDeleteAccount?.call(),
+                child: isDeletingAccount
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Supprimer mon compte'),
               ),
-              const SizedBox(height: 16),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text('Rejoindre une entreprise',
-                          style: Theme.of(context).textTheme.titleLarge),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: joinCodeCtrl,
-                        textCapitalization: TextCapitalization.characters,
-                        decoration: const InputDecoration(
-                          labelText: 'Code d’accès',
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      OutlinedButton.icon(
-                        onPressed: joiningCompany ? null : onJoinCompany,
-                        icon: joiningCompany
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.qr_code_2),
-                        label: const Text('Rejoindre'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -5826,12 +8773,9 @@ class _FabMenuOption {
   final IconData icon;
   final _AsyncCallback action;
 
-  @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () {
-        action();
-      },
+      onTap: action,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(
@@ -5900,12 +8844,15 @@ class _InventorySearchSheetState extends State<_InventorySearchSheet> {
   @override
   Widget build(BuildContext context) {
     final query = _controller.text.trim().toLowerCase();
-    final filtered = widget.inventory.where((entry) {
-      if (query.isEmpty) return true;
-      final name = entry.item['name']?.toString().toLowerCase() ?? '';
-      final sku = entry.item['sku']?.toString().toLowerCase() ?? '';
-      return name.contains(query) || sku.contains(query);
-    }).take(60).toList();
+    final filtered = widget.inventory
+        .where((entry) {
+          if (query.isEmpty) return true;
+          final name = entry.item['name']?.toString().toLowerCase() ?? '';
+          final sku = entry.item['sku']?.toString().toLowerCase() ?? '';
+          return name.contains(query) || sku.contains(query);
+        })
+        .take(60)
+        .toList();
 
     return Material(
       color: Colors.white,
@@ -5948,8 +8895,7 @@ class _InventorySearchSheetState extends State<_InventorySearchSheet> {
                           final entry = filtered[index];
                           final name =
                               entry.item['name']?.toString() ?? 'Article';
-                          final sku =
-                              entry.item['sku']?.toString() ?? '';
+                          final sku = entry.item['sku']?.toString() ?? '';
                           final total = entry.totalQty;
                           return ListTile(
                             title: Text(name),
@@ -6041,6 +8987,42 @@ class _IntegerInputDialogState extends State<_IntegerInputDialog> {
   }
 }
 
+String _memberDisplayName(Map<String, dynamic> member) {
+  String pickField(String key) => member[key]?.toString().trim() ?? '';
+  final fullName = pickField('full_name');
+  final firstName = pickField('first_name');
+  final lastName = pickField('last_name');
+  final displayName = pickField('display_name');
+  final composed = [firstName, lastName].where((value) => value.isNotEmpty);
+  final composedName = composed.join(' ').trim();
+  if (fullName.isNotEmpty) return fullName;
+  if (composedName.isNotEmpty) return composedName;
+  if (displayName.isNotEmpty) return displayName;
+  final email = pickField('email');
+  return email.isNotEmpty ? email : 'Membre';
+}
+
+String _memberEmail(Map<String, dynamic> member) {
+  return member['email']?.toString().trim() ?? '';
+}
+
+String? _equipmentAssignedUserId(Map<String, dynamic> equipment) {
+  final meta = equipment['meta'];
+  if (meta is! Map) return null;
+  final value = meta[_equipmentAssignedToKey];
+  if (value == null) return null;
+  final id = value.toString().trim();
+  return id.isEmpty ? null : id;
+}
+
+String? _equipmentAssignedName(Map<String, dynamic> equipment) {
+  final meta = equipment['meta'];
+  if (meta is! Map) return null;
+  final value = meta[_equipmentAssignedNameKey]?.toString().trim();
+  if (value == null || value.isEmpty) return null;
+  return value;
+}
+
 class _DecimalInputDialog extends StatefulWidget {
   const _DecimalInputDialog({
     required this.title,
@@ -6079,8 +9061,7 @@ class _DecimalInputDialogState extends State<_DecimalInputDialog> {
             helperText: widget.helperText,
           ),
           validator: (value) {
-            final parsed =
-                double.tryParse((value ?? '').replaceAll(',', '.'));
+            final parsed = double.tryParse((value ?? '').replaceAll(',', '.'));
             if (parsed == null || parsed <= 0) {
               return 'Entre une valeur positive.';
             }

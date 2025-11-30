@@ -15,6 +15,8 @@ class AppColors {
   static const tonalForeground = Color(0xFF3F3F46);
   static const tonalBorder = Color(0xFFD5BFA8);
 
+  static const accent = Color(0xFF2563EB); // Bleu moderne pour les accents
+
   static const outline = Color(0xFF9A5E33);
 
   static const danger = Color(0xFFD72638);

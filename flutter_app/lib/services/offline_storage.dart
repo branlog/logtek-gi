@@ -14,6 +14,9 @@ class OfflineCacheKeys {
   static const purchaseRequests = 'purchase_requests';
   static const journalEntries = 'journal_entries';
   static const equipment = 'equipment';
+  static const joinCodes = 'join_codes';
+  static const membershipInvites = 'membership_invites';
+  static const userProfile = 'user_profile';
 }
 
 class PendingAction {
@@ -39,6 +42,7 @@ class OfflineStorage {
 
   final _uuid = const Uuid();
   Database? _db;
+  final Map<String, String> _idMappingCache = <String, String>{};
 
   Future<void> init() async {
     if (_db != null) return;
@@ -46,7 +50,7 @@ class OfflineStorage {
     final path = p.join(dir.path, 'offline_cache.db');
     _db = await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute(
           'CREATE TABLE cache_entries (key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)',
@@ -60,8 +64,27 @@ class OfflineStorage {
           'last_error TEXT'
           ')',
         );
+        await db.execute(
+          'CREATE TABLE id_mappings ('
+          'temp_id TEXT PRIMARY KEY,'
+          'actual_id TEXT NOT NULL,'
+          'created_at INTEGER NOT NULL'
+          ')',
+        );
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+            'CREATE TABLE IF NOT EXISTS id_mappings ('
+            'temp_id TEXT PRIMARY KEY,'
+            'actual_id TEXT NOT NULL,'
+            'created_at INTEGER NOT NULL'
+            ')',
+          );
+        }
       },
     );
+    await _hydrateIdMappingCache();
   }
 
   Future<void> saveCache(String key, Object data) async {
@@ -106,6 +129,8 @@ class OfflineStorage {
       whereArgs: <Object?>['$userId::%'],
     );
     await db.delete('pending_actions');
+    await db.delete('id_mappings');
+    _idMappingCache.clear();
   }
 
   Future<String> enqueueAction({
@@ -166,11 +191,100 @@ class OfflineStorage {
     );
   }
 
+  /// Sauvegarde une préférence utilisateur
+  Future<void> setPreference(String key, String value) async {
+    final db = _requireDb();
+    await db.insert(
+      'cache_entries',
+      {
+        'key': 'pref::$key',
+        'payload': value,
+        'updated_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Récupère une préférence utilisateur
+  Future<String?> getPreference(String key) async {
+    final db = _requireDb();
+    final rows = await db.query(
+      'cache_entries',
+      where: 'key = ?',
+      whereArgs: <Object?>['pref::$key'],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['payload'] as String?;
+  }
+
   Database _requireDb() {
     final db = _db;
     if (db == null) {
       throw StateError('OfflineStorage.init() doit être appelé avant usage.');
     }
     return db;
+  }
+
+  Future<void> saveIdMapping(String tempId, String actualId) async {
+    final db = _requireDb();
+    await db.insert(
+      'id_mappings',
+      {
+        'temp_id': tempId,
+        'actual_id': actualId,
+        'created_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    _idMappingCache[tempId] = actualId;
+  }
+
+  Future<String?> resolveIdMapping(String tempId) async {
+    final cached = _idMappingCache[tempId];
+    if (cached != null) return cached;
+    final db = _requireDb();
+    final rows = await db.query(
+      'id_mappings',
+      columns: const ['actual_id'],
+      where: 'temp_id = ?',
+      whereArgs: <Object?>[tempId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final actual = rows.first['actual_id'] as String?;
+    if (actual != null) {
+      _idMappingCache[tempId] = actual;
+    }
+    return actual;
+  }
+
+  Future<Map<String, String>> loadAllIdMappings() async {
+    final db = _requireDb();
+    final rows = await db.query('id_mappings');
+    final map = <String, String>{};
+    for (final row in rows) {
+      final temp = row['temp_id'] as String?;
+      final actual = row['actual_id'] as String?;
+      if (temp != null && actual != null) {
+        map[temp] = actual;
+      }
+    }
+    _idMappingCache
+      ..clear()
+      ..addAll(map);
+    return Map<String, String>.from(_idMappingCache);
+  }
+
+  Map<String, String> snapshotIdMappings() {
+    return Map<String, String>.from(_idMappingCache);
+  }
+
+  Future<void> _hydrateIdMappingCache() async {
+    try {
+      await loadAllIdMappings();
+    } catch (_) {
+      // ignore cache load errors
+    }
   }
 }

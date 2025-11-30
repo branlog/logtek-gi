@@ -248,6 +248,81 @@ class CompanyCommands {
     }
   }
 
+  Future<CommandResult<Map<String, dynamic>>> updateItem({
+    required String itemId,
+    String? name,
+    String? sku,
+    Map<String, dynamic>? meta,
+  }) async {
+    final payload = <String, dynamic>{};
+    if (name != null) {
+      final trimmed = name.trim();
+      if (trimmed.isEmpty) {
+        return const CommandResult(error: 'Nom requis.');
+      }
+      payload['name'] = trimmed;
+    }
+    if (sku != null) {
+      payload['sku'] = sku.trim().isEmpty ? null : sku.trim();
+    }
+    if (meta != null) {
+      payload['meta'] = meta;
+    }
+    if (payload.isEmpty) {
+      return const CommandResult(error: 'Aucune modification fournie.');
+    }
+
+    try {
+      final response = await _client
+          .from('items')
+          .update(payload)
+          .eq('id', itemId)
+          .select(
+            'id, name, sku, unit, category, active, meta, created_at',
+          )
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+            error: 'Pièce introuvable ou déjà supprimée.');
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
+  Future<CommandResult<Map<String, dynamic>>> updateItemMeta({
+    required String itemId,
+    required Map<String, dynamic> meta,
+  }) async {
+    try {
+      final response = await _client
+          .from('items')
+          .update({'meta': meta})
+          .eq('id', itemId)
+          .select(
+            'id, name, sku, unit, category, active, meta, created_at',
+          )
+          .maybeSingle();
+      if (response == null) {
+        return const CommandResult(
+          error: 'Pièce introuvable ou déjà supprimée.',
+        );
+      }
+      return CommandResult<Map<String, dynamic>>(
+        data: Map<String, dynamic>.from(response as Map),
+      );
+    } on PostgrestException catch (error) {
+      return CommandResult(error: error.message);
+    } catch (error) {
+      return CommandResult(error: error);
+    }
+  }
+
   Future<CommandResult<int>> applyStockDelta({
     required String companyId,
     required String itemId,
@@ -360,6 +435,9 @@ class CompanyCommands {
     String? brand,
     String? model,
     String? serial,
+    String? type,
+    String? year,
+    Map<String, dynamic>? meta,
   }) async {
     final payload = <String, dynamic>{
       'company_id': companyId,
@@ -368,6 +446,13 @@ class CompanyCommands {
       if (model != null && model.trim().isNotEmpty) 'model': model.trim(),
       if (serial != null && serial.trim().isNotEmpty) 'serial': serial.trim(),
     };
+    final metaMap = <String, dynamic>{};
+    if (meta != null) metaMap.addAll(meta);
+    if (type != null && type.trim().isNotEmpty) metaMap['type'] = type.trim();
+    if (year != null && year.trim().isNotEmpty) metaMap['year'] = year.trim();
+    if (metaMap.isNotEmpty) {
+      payload['meta'] = metaMap;
+    }
 
     try {
       final response =
@@ -389,6 +474,9 @@ class CompanyCommands {
     String? model,
     String? serial,
     bool? active,
+    String? type,
+    String? year,
+    Map<String, dynamic>? meta,
   }) async {
     final payload = <String, dynamic>{};
 
@@ -412,6 +500,13 @@ class CompanyCommands {
     handleOptional('serial', serial);
     if (active != null) {
       payload['active'] = active;
+    }
+    final metaMap = <String, dynamic>{};
+    if (meta != null) metaMap.addAll(meta);
+    if (type != null && type.trim().isNotEmpty) metaMap['type'] = type.trim();
+    if (year != null && year.trim().isNotEmpty) metaMap['year'] = year.trim();
+    if (metaMap.isNotEmpty) {
+      payload['meta'] = metaMap;
     }
 
     if (payload.isEmpty) {
@@ -446,19 +541,13 @@ class CompanyCommands {
     required String equipmentId,
   }) async {
     try {
-      final response = await _client
-          .from('equipment')
-          .delete()
-          .eq('id', equipmentId)
-          .select('id')
-          .maybeSingle();
-      if (response == null) {
-        return const CommandResult(
-          error: 'Équipement introuvable ou déjà supprimé.',
-        );
-      }
+      await _client.from('equipment').delete().eq('id', equipmentId);
       return const CommandResult<void>(data: null);
     } on PostgrestException catch (error) {
+      if (error.code == 'PGRST116') {
+        // No row affected: treat as already deleted.
+        return const CommandResult<void>(data: null);
+      }
       return CommandResult<void>(error: error.message);
     } catch (error) {
       return CommandResult<void>(error: error);
@@ -487,6 +576,11 @@ class CompanyCommands {
         data: Map<String, dynamic>.from(response as Map),
       );
     } on PostgrestException catch (error) {
+      if (error.code == 'PGRST116') {
+        return const CommandResult(
+          error: 'Équipement introuvable ou déjà supprimé.',
+        );
+      }
       return CommandResult(error: error.message);
     } catch (error) {
       return CommandResult(error: error);
@@ -520,19 +614,26 @@ class CompanyCommands {
 
   Future<List<Map<String, dynamic>>> fetchJournalEntries({
     required String companyId,
-    required String scope,
+    String? scope,
     String? entityId,
     int limit = 50,
+    bool prefix = false,
   }) async {
     var query = _client
         .from('journal_entries')
         .select(
           'id, scope, entity_id, event, note, payload, created_at, created_by',
         )
-        .eq('company_id', companyId)
-        .eq('scope', scope);
+        .eq('company_id', companyId);
+    if (scope != null) {
+      query = query.eq('scope', scope);
+    }
     if (entityId != null && entityId.isNotEmpty) {
-      query = query.eq('entity_id', entityId);
+      if (prefix) {
+        query = query.like('entity_id', '$entityId%');
+      } else {
+        query = query.eq('entity_id', entityId);
+      }
     }
     final response =
         await query.order('created_at', ascending: false).limit(limit);
@@ -546,6 +647,7 @@ class CompanyCommands {
     String? warehouseId,
     String? sectionId,
     String? note,
+    String? itemId,
   }) async {
     final currentUser = _client.auth.currentUser;
     if (currentUser == null) {
@@ -557,6 +659,7 @@ class CompanyCommands {
       'created_by': currentUser.id,
       'name': name.trim(),
       'qty': qty,
+      if (itemId != null && itemId.isNotEmpty) 'item_id': itemId,
       if (warehouseId != null && warehouseId.isNotEmpty)
         'warehouse_id': warehouseId,
       if (sectionId != null && sectionId.isNotEmpty) 'section_id': sectionId,
@@ -938,11 +1041,63 @@ class CompanyCommands {
   Future<CommandResult<void>> deleteJoinCode({
     required String codeId,
   }) async {
+    Future<CommandResult<void>> fallbackDelete() async {
+      try {
+        final response = await _client
+            .from('company_join_codes')
+            .delete()
+            .eq('id', codeId)
+            .select('id')
+            .maybeSingle();
+        if (response == null) {
+          return const CommandResult<void>(
+            error: 'Code introuvable ou déjà supprimé.',
+          );
+        }
+        return const CommandResult<void>(data: null);
+      } on PostgrestException catch (error) {
+        final detailText = error.details?.toString() ?? '';
+        if (error.code == 'PGRST116' || detailText.contains('0 rows')) {
+          return const CommandResult<void>(data: null);
+        }
+        return CommandResult<void>(error: error.message);
+      } catch (error) {
+        return CommandResult<void>(error: error);
+      }
+    }
+
     try {
-      await _client.from('company_join_codes').delete().eq('id', codeId);
+      final result = await _client.rpc(
+        'delete_join_code',
+        params: {'p_code_id': codeId},
+      );
+      final deleted = result is bool
+          ? result
+          : result is int
+              ? result > 0
+              : result != null;
+      if (!deleted) {
+        return const CommandResult<void>(
+          error: 'Code introuvable ou déjà supprimé.',
+        );
+      }
       return const CommandResult<void>(data: null);
     } on PostgrestException catch (error) {
+      final message = error.message;
+      if (message.contains('delete_join_code')) {
+        return fallbackDelete();
+      }
       return CommandResult<void>(error: error.message);
+    } on FunctionException catch (error) {
+      final detail = error.details?.toString();
+      if ((detail ?? '').contains('delete_join_code')) {
+        return fallbackDelete();
+      }
+      return CommandResult<void>(
+        error: detail?.isNotEmpty == true
+            ? detail
+            : error.reasonPhrase ?? 'Impossible de supprimer ce code.',
+      );
     } catch (error) {
       return CommandResult<void>(error: error);
     }
@@ -969,6 +1124,22 @@ class CompanyCommands {
         error: detail?.isNotEmpty == true
             ? detail
             : error.reasonPhrase ?? 'Impossible de rejoindre cette entreprise.',
+      );
+    } catch (error) {
+      return CommandResult<void>(error: error);
+    }
+  }
+
+  Future<CommandResult<void>> deleteAccount() async {
+    try {
+      await _client.functions.invoke('delete-account');
+      return const CommandResult<void>(data: null);
+    } on FunctionException catch (error) {
+      final detail = error.details?.toString();
+      return CommandResult<void>(
+        error: detail?.isNotEmpty == true
+            ? detail
+            : error.reasonPhrase ?? 'Suppression impossible.',
       );
     } catch (error) {
       return CommandResult<void>(error: error);
